@@ -41,7 +41,9 @@ def _collect_layer(folder: Path) -> list[tuple[str, str]]:
     entries: list[tuple[str, str]] = []
     if not folder.is_dir():
         return entries
-    for path in sorted(folder.glob("*.md")):
+    for path in sorted(folder.rglob("*.md")):
+        if path.name.upper() == "README.MD":
+            continue
         raw = path.read_text(encoding="utf-8")
         content = _strip_frontmatter(raw).strip()
         if content:
