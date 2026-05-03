@@ -2981,6 +2981,8 @@ See sample: `protect-sensitive-data-in-temporary-tables.bad.al`.
 ## NAV-X Organisation Standards (Layer 3)
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 Consistent object and variable naming is required across all NAV-X extensions.
@@ -3021,6 +3023,8 @@ end;
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 The API Register Fieldset pattern allows other extensions to declare which fields
@@ -3076,6 +3080,8 @@ page 50060 "NAVX Customer API"
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 AL allows single-statement `if` bodies without `begin`/`end`, but omitting them
@@ -3116,6 +3122,8 @@ if Customer.Get(CustomerNo) then
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 The Command Queue pattern decouples the triggering of an operation from its
@@ -3159,6 +3167,8 @@ end;
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 `Commit()` in AL permanently writes the current transaction to the database and
@@ -3211,6 +3221,8 @@ end;
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 Every database read in AL can return false or raise a runtime error if the record
@@ -3263,6 +3275,8 @@ SalesLine.FindSet();
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 `DeleteAll(true)` runs the `OnDelete` trigger and all `OnBeforeDeleteEvent` /
@@ -3304,6 +3318,8 @@ LogEntry.DeleteAll(true); // runs OnDelete N times; use false for log cleanup
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 The "if not find — exit" (guard clause) pattern exits a procedure immediately
@@ -3358,6 +3374,8 @@ end;
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 The Event Bridge pattern re-publishes a Base Application or NAV-X Library event
@@ -3403,6 +3421,8 @@ local procedure HandlePost1(...) begin end;
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 AL event subscribers are the primary extension point in Business Central. Incorrect
@@ -3443,6 +3463,8 @@ end;
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 The Façade pattern wraps complex business logic in a single management codeunit
@@ -3501,6 +3523,8 @@ Scattering business logic across multiple codeunits with no single entry point, 
 calling internal helper codeunits directly from event subscribers.
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 The Generic Method pattern implements shared logic once using a `Variant` or
@@ -3554,6 +3578,58 @@ end;
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
+## Description
+
+`Rec.Modify(true)` fires the table's `OnBeforeModify` and `OnAfterModify` triggers and all
+subscribers. `Rec.Modify(false)` skips those triggers entirely. This distinction is one of
+the most commonly misunderstood in AL and is a frequent source of missed audit entries, sync
+failures, and silent data divergence when `Modify(false)` is used without intention.
+
+## Best Practice
+
+Use `Modify(true)` (the default) for all user-facing data changes where other extensions or
+base-app logic may need to react. Only call `Modify(false)` for deliberate internal
+bookkeeping updates — status flags, timestamps — where triggering subscribers would be
+correctly wrong. Every `Modify(false)` call must have a comment explaining why.
+
+For logic that must always execute regardless of how a record is saved — audit logging,
+external sync, cross-table updates — publish a dedicated integration event and subscribe to
+it. Do not rely on `OnAfterModify` for cross-extension coordination.
+
+```al
+// Correct: data change — trigger must cascade
+Rec.Description := NewDescription;
+Rec.Modify(true);
+
+// Correct: internal status flag — deliberately no cascade; document why
+Rec."Processing Status" := Rec."Processing Status"::Completed;
+Rec.Modify(false);  // status-only; subscribers react via OnAfterStatusChanged event
+```
+
+## Anti Pattern
+
+Using `Modify(false)` as a performance shortcut on real data changes, or subscribing to
+`OnAfterModify` for critical cross-extension logic that will silently break if any caller
+uses `Modify(false)`.
+
+```al
+// WRONG: Modify(false) used for speed on a data field — audit subscriber never fires
+Rec.Amount := CalculatedAmount;
+Rec.Modify(false);  // audit log silently skipped
+
+// WRONG: cross-extension sync via OnAfterModify — breaks silently when Modify(false) is called
+[EventSubscriber(ObjectType::Table, Database::"Sales Header", 'OnAfterModifyEvent', '', false, false)]
+local procedure SyncToExternal(var Rec: Record "Sales Header")
+begin
+    ExternalSync.Push(Rec);  // will not fire if any code uses Modify(false)
+end;
+```
+
+
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 BC 23+ introduced a new `No. Series` codeunit replacing the deprecated
@@ -3593,6 +3669,8 @@ end;
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 Every AL object must have an ID within the app's own `idRanges` declared in `app.json`.
@@ -3629,6 +3707,8 @@ codeunit 60000 "NAVX My New Codeunit"
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 NAV-X delivers both Per-Tenant Extensions (PTEs) for individual clients and AppSource
@@ -3668,6 +3748,8 @@ table 18 Customer
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 By default, a `FindSet`/`Get` call loads every field of the record. On large tables
@@ -3711,6 +3793,8 @@ if SalesLine.FindSet() then
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 NAV-X extensions use a singleton setup table per feature area to hold configuration.
@@ -3763,6 +3847,8 @@ if SetupRec.FindFirst() then
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 AL has a strict split between table-level and page-level field properties.
@@ -3811,6 +3897,8 @@ field(10; "Commission Rate"; Decimal)
 ```
 
 
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
 The Template Method pattern defines the skeleton of an algorithm in a base
@@ -3866,4 +3954,59 @@ codeunit 50071 "NAVX Price Calc. For Group A"
         // identical to Template except one line
     end;
 }
+```
+
+
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
+## Description
+
+Temporary tables (`IsTemporary = true` or declared as `temporary` in a procedure variable)
+hold records only in memory for the lifetime of the codeunit or variable scope. They do not
+write to the database and do not fire record-level triggers on `Insert` / `Modify` / `Delete`.
+Misusing temporary tables — or using real tables for transient work — causes data pollution
+and performance problems.
+
+## Best Practice
+
+Declare temporary table variables explicitly with the `temporary` keyword. Use them for
+intermediate sorting, filtering, or accumulation before writing final results to a persistent
+table. Always call `Reset()` and `DeleteAll()` before re-populating a temporary table that
+may have been used in a previous loop iteration.
+
+Do not rely on record-level triggers (`OnInsert`, `OnModify`, `OnDelete`) firing when you
+write to a temporary table — those triggers do not run on the in-memory copy.
+
+```al
+// Correct: accumulate in temp table, then write once to real table
+local procedure CommitResults(var TempBuffer: Record "NAVX Work Buffer" temporary)
+var
+    FinalRecord: Record "NAVX Result Entry";
+begin
+    TempBuffer.Reset();
+    if TempBuffer.FindSet() then
+        repeat
+            FinalRecord.Init();
+            FinalRecord.TransferFields(TempBuffer);
+            FinalRecord.Insert(true);
+        until TempBuffer.Next() = 0;
+end;
+```
+
+## Anti Pattern
+
+Using a real (persistent) table as scratch space for transient processing. Any error before
+cleanup leaves orphan rows; performance is worse due to unnecessary I/O.
+
+```al
+// WRONG — real table used as scratch; rows persist if an error occurs before DeleteAll
+var
+    WorkRecord: Record "NAVX Work Buffer";  // not temporary
+begin
+    WorkRecord.Init();
+    WorkRecord."Entry No." := GetNextEntryNo();
+    WorkRecord.Insert();  // writes to database
+    // ... if an error is thrown here, WorkRecord row is never cleaned up
+    WorkRecord.DeleteAll();
+end;
 ```
