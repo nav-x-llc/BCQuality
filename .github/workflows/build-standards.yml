@@ -1,0 +1,36 @@
+name: Build AL Standards
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'microsoft/**'
+      - 'community/**'
+      - 'custom/**'
+      - 'scripts/generate_standards.py'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install azure-storage-blob azure-identity
+
+      - name: Generate and upload al_standards.md
+        env:
+          QUINN_STORAGE: ${{ secrets.QUINN_ASSETS_STORAGE_CONNECTION_STRING }}
+        run: python scripts/generate_standards.py --output al_standards.md --upload
+
+      - name: Commit generated file to repo
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore: regenerate al_standards.md'
+          file_pattern: al_standards.md
+          branch: main
