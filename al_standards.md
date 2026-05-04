@@ -3084,15 +3084,29 @@ page 50060 "NAVX Customer API"
 > **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
-AL allows single-statement `if` bodies without `begin`/`end`, but omitting them
-is a common source of bugs when additional statements are added later. NAV-X
-requires `begin`/`end` on every `if`, `else`, `for`, `while`, and `repeat` body,
-even when it contains only one statement.
+AL single-statement `if`, `else`, `for`, `while`, and `repeat` bodies
+must be placed on the **next line, indented** — no `begin`/`end` wrapper.
+`begin`/`end` is only required when the body contains two or more statements.
+
+Placing the statement on the same line as `then` (or `do`) makes it invisible
+at a glance and is a common source of bugs.
 
 ## Best Practice
 
-Always wrap `if`, `else`, `for`, `while`, and `with` bodies in `begin`/`end`.
-This prevents the "dangling else" class of bugs and makes diffs easier to read.
+Single statement — next line, indented, no `begin`/`end`:
+
+```al
+if not Customer.Get(CustomerNo) then
+    exit;
+
+if (Rec.Type <> Rec.Type::Item) or (Rec."No." = '') then
+    exit;
+
+for i := 1 to Count do
+    ProcessItem(i);
+```
+
+Multi-statement body — always wrap in `begin`/`end`:
 
 ```al
 if Customer.Get(CustomerNo) then begin
@@ -3103,22 +3117,23 @@ end else begin
 end;
 ```
 
-```al
-for i := 1 to 10 do begin
-    ProcessItem(i);
-end;
-```
-
 ## Anti Pattern
 
-Omitting `begin`/`end` on single-statement if bodies, which breaks silently when
-a second statement is added.
+**Statement on the same line as `then`/`do` (hard to read, easy to mis-read):**
 
 ```al
-// WRONG — second statement is NOT inside the if, despite the indentation
-if Customer.Get(CustomerNo) then
-    ProcessCustomer(Customer);
-    LogAccess(Customer."No.");  // always runs, even when Get fails
+// BAD
+if not Customer.Get(CustomerNo) then exit;
+for i := 1 to Count do ProcessItem(i);
+```
+
+**Unnecessary `begin`/`end` around a single statement (verbose, not required):**
+
+```al
+// BAD
+if (Rec.Type <> Rec.Type::Item) or (Rec."No." = '') then begin
+    exit;
+end;
 ```
 
 
