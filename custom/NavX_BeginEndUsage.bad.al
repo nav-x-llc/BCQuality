@@ -2,8 +2,11 @@ procedure ProcessIfFoundBad(CustomerNo: Code[20])
 var
     Customer: Record Customer;
 begin
-    // BAD: missing begin/end — LogAccess always runs regardless of Get result
-    if Customer.Get(CustomerNo) then
-        ProcessCustomer(Customer);
-        LogAccess(Customer."No.");  // BUG: runs even when Customer not found
+    // BAD: statement on same line as then — hard to read
+    if not Customer.Get(CustomerNo) then exit;
+
+    // BAD: unnecessary begin/end around a single statement
+    if Customer.Blocked <> Customer.Blocked::" " then begin
+        Error('Blocked');
+    end;
 end;
