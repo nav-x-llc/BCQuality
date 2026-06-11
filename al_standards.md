@@ -8,42 +8,76 @@
 ## Microsoft Quality Standards (Layer 1)
 
 
-# Add SIFT keys for FlowField aggregations
+# In reports, declare the fields the layout needs with AddLoadFields
 
 ## Description
 
-CodeCop rule AA0232 checks that FlowFields backed by CalcSums or aggregation CalcFormula are supported by a key whose SumIndexFields include the summed field and whose key prefix matches the formula's filter fields. Without a SIFT key the platform falls back to a full aggregation on every read — typically invisible in development and catastrophic in production.
+Reports iterate dataitems on potentially large source tables and pipe rows into a layout. The partial-record optimization is the same idea as `use-setloadfields-for-partial-records.md`, but the API is different: per the upstream guidance, "for reports, use `AddLoadFields()` in `OnPreDataItem` trigger to add fields needed by the layout." `AddLoadFields` is additive — call it for each field the layout consumes — and runs once per dataitem before iteration begins.
 
 ## Best Practice
 
-For each Sum-style FlowField, ensure the source table has a key whose leading fields match the FlowField's CalcFormula WHERE clause and whose SumIndexFields list includes the summed field. Table extensions adding new FlowFields are responsible for adding the supporting key.
+In each dataitem's `OnPreDataItem` trigger, list the columns the layout binds to via `AddLoadFields(<field>, <field>, ...)`. The platform then materializes only those columns per row. Treat the layout column list as the spec: every column the layout uses must be added; columns the layout does not use should not be added.
 
-See sample: `add-sift-keys-for-flowfields.good.al`.
+See sample: `addloadfields-in-report-onpredataitem.good.al`.
 
 ## Anti Pattern
 
-Declaring a FlowField on a hot table without checking whether a supporting SIFT key exists ships a latent scan into every list page and report that touches the field.
+Relying on the dataitem's default to load every field. On a report bound to a ledger-scale table this transfers an entire row per iteration, of which the layout reads a fraction.
+
+See sample: `addloadfields-in-report-onpredataitem.bad.al`.
 
 
-# Do not call CalcFields inside loops
+# Admin and migration pages tolerate lower performance discipline
 
 ## Description
 
-CalcFields evaluates one or more FlowFields for the current record by issuing a separate SQL aggregation. Called inside a loop over a record set, it becomes an N+1 problem: one aggregate per row. For any non-trivial set on a ledger-entry-backed FlowField this is orders of magnitude slower than the equivalent batched query.
+Some pages run rarely and against small datasets, and the upstream guidance explicitly calls for treating them as lower severity. Per the review checklist, "Admin/migration pages (`Admin`, `Setup`, `Wizard`, `Migration`, `HybridBC14`, `HybridSL`, `HybridGP` namespaces, `Permissions`/`PermissionSet` pages) are infrequently used with small datasets — apply lower severity." The same logic covers one-time wizards and tenant-bootstrap routines: the code path runs a handful of times in the lifetime of a tenant, against a bounded dataset, by an administrator.
 
 ## Best Practice
 
-Move CalcFields out of the iteration. If the total is what you need, use CalcSums on the filtered parent set. If row-by-row FlowField values are needed, reshape the computation so the aggregate runs once — for example by joining against a temporary table populated in a single batched query.
-
-**Acceptable exceptions:** CalcFields inside an `OnAfterGetRecord` page trigger is the standard pattern for displaying computed FlowField values — the platform calls this trigger once per row and it is not a developer-authored loop. Similarly, CalcFields inside an `OnValidate` field trigger fires at most once per user action and is acceptable. The concern is only developer-written `FindSet … repeat … until Next() = 0` loops.
-
-See sample: `avoid-calcfields-in-loops.good.al`.
+When triaging a finding on an admin, migration, or wizard page, downgrade severity relative to the same finding on a hot business path. A `FindSet` loop without `SetLoadFields` on a migration page that processes setup records once per tenant is a different finding than the same loop on a posting routine that runs thousands of times a day. Note this context explicitly in the review so the call site is not "fixed" twice with diminishing returns.
 
 ## Anti Pattern
 
-Calling CalcFields inside `repeat ... until Next() = 0` on a hot parent record is the textbook N+1 pattern. Even a modest parent set size (hundreds of rows) turns into thousands of round-trips.
+Treating a migration wizard's per-row loop with the same urgency as the same loop in `Sales-Post`. The fix cost is the same; the production benefit is not. Bulk-rewriting an admin page to use `ModifyAll` and partial records buys nothing the user will perceive.
 
-See sample: `avoid-calcfields-in-loops.bad.al`.
+
+# Apply SetRange/SetFilter before iterating, not as an if-test inside the loop
+
+## Description
+
+A `SetRange` or `SetFilter` placed before `FindSet` narrows the result set at the database. The same condition expressed as an `if` inside the loop body filters in AL, after every row has crossed the boundary. Per the upstream guidance, "apply `SetRange`/`SetFilter` as early as possible to reduce dataset" and "more specific filters = better performance." On a production-scale table the difference is the difference between scanning a subset and scanning the whole table.
+
+## Best Practice
+
+Move every predicate that can be expressed as an equality or range filter into a `SetRange` or `SetFilter` ahead of the find. Combine with `SetCurrentKey` to choose a key whose first fields match the filter (see `setcurrentkey-aligns-key-with-filters.md`). The loop body should then contain only the work that depends on per-row state.
+
+See sample: `apply-filters-before-iterating.good.al`.
+
+## Anti Pattern
+
+`if Customer.FindSet() then repeat if Customer."Country/Region Code" = 'US' then ProcessCustomer(Customer); until Customer.Next() = 0;` — the loop pays for every row in the table and discards the non-matching ones in AL. The intent is the same as a `SetRange("Country/Region Code", 'US')` ahead of the find, but the cost is not.
+
+See sample: `apply-filters-before-iterating.bad.al`.
+
+
+# Apply early-exit guards before calling Get
+
+## Description
+
+A `Get` (or any other database call) executed before a guard that may exit the procedure does a round-trip the procedure never uses. Per the upstream guidance, "Flag `Get()` calls that execute before a guard condition that may exit early — the DB lookup is wasted." The fix is structural: order the procedure body so cheap checks (parameter validation, in-memory field comparisons, enum tests) run first, and the database call runs only after the guards pass.
+
+## Best Practice
+
+Read the procedure top-to-bottom and place every condition that can short-circuit ahead of every database call. The check `if SomeNo = '' then exit;` belongs above `Header.Get(...)`, not below. Each guard moved upward saves one wasted query on the path that exits.
+
+See sample: `apply-guards-before-get.good.al`.
+
+## Anti Pattern
+
+`Record.Get(...)` at the top of a procedure followed by `if SomeField = '' then exit;`. The code reads top-down as "load the record, then decide whether we needed it" — exactly the order that wastes the query. The pattern is easy to introduce when guards are added later, defensively, without re-checking call ordering.
+
+See sample: `apply-guards-before-get.bad.al`.
 
 
 # Do not Commit inside loops
@@ -67,61 +101,99 @@ Placing Commit inside `repeat ... until Next() = 0` is almost always a mistake: 
 See sample: `avoid-commit-inside-loops.bad.al`.
 
 
-# Do not pair FindFirst, FindLast, or Get with Next
+# Avoid Get / FindFirst inside a loop on a large inner table
 
 ## Description
 
-CodeCop rule AA0233 flags loops that start with FindFirst, FindLast, or Get and then call Next. FindFirst and FindLast retrieve a single row and reposition the cursor; calling Next after them forces the platform to re-seek and stream the rest of the set, which is slower than the correct FindSet pattern and signals intent incorrectly to reviewers and the optimizer.
+A `Get` or `FindFirst` against a different record inside a loop body produces one database round-trip per iteration — the classic N+1 pattern. Per the upstream guidance, "Flag when a `Get()`/`FindFirst()` is called inside a loop for each record — this creates N+1 database round-trips." The cost only matters when the inner table is meaningful: lookups against temporary tables, singleton setup tables, enum-mapping tables, permission objects, or Role IDs are bounded and safe. The pattern to catch is the inner lookup that hits a production-scale table for every outer row.
 
 ## Best Practice
 
-Choose the Find variant that matches the operation: FindSet for full iteration, FindFirst or FindLast when you want exactly one row, Get when the primary key is known. Never call Next after FindFirst, FindLast, or Get.
+When the loop needs values from another record, lift the lookup out of the loop if the rows can be collected up front, or apply `SetLoadFields` so each inner read transfers only the columns the loop actually uses (see `use-setloadfields-for-partial-records.md`). When the inner record is small or bounded, leave the call site alone — the rule targets large-table inner lookups specifically.
+
+See sample: `avoid-get-inside-loop-on-large-table.good.al`.
 
 ## Anti Pattern
 
-Writing `if Rec.FindFirst() then repeat ... until Rec.Next() = 0` is the canonical AA0233 offender. The loop wastes bandwidth and obscures the author's intent.
+Iterating BOM lines and calling `Item.Get(BOMLine."No.")` per row to read a costing method, with no `SetLoadFields` on `Item`. Each iteration issues one query against Item (~800k rows) and pulls the entire row to read two fields. The fix is `Item.SetLoadFields("Costing Method", "Standard Cost");` ahead of the loop — still N reads, but each one transfers only the needed columns.
 
-See sample: `avoid-findfirst-with-next.bad.al`.
+See sample: `avoid-get-inside-loop-on-large-table.bad.al`.
 
 
-# Do not prompt the user inside a write transaction
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Avoid RecordRef / FieldRef in hot loops when a typed record fits
 
 ## Description
 
-Confirm, StrMenu, Message, and any other user-facing dialog pauses execution while the transaction is still open. During that pause every lock held by the transaction blocks other sessions. A user who walks away from the screen can suspend business-critical tables for an unbounded period.
+`RecordRef` and `FieldRef` are slower than direct typed record access — the platform resolves the table and field at runtime instead of at compile time. The trade-off is intentional: per the upstream guidance, "RecordRef/FieldRef operations are slower than direct record access, but many features REQUIRE them for generic metadata iteration (permission checks, field copying, dynamic field access)." The rule, then, is not "never use them" but "only flag when used inside a clearly unbounded hot loop (10k+ iterations) where a typed alternative exists."
 
 ## Best Practice
 
-Gather every user decision before the writing phase begins. Once the decisions are known, run the transaction end-to-end without prompts.
+Use `RecordRef`/`FieldRef` for genuinely generic code — permission checks, field copying, table-agnostic export. When the loop target is known at compile time and the loop iterates a large number of rows, declare the typed record and access fields directly; the saved per-iteration overhead is measurable at the volumes the rule targets.
 
-See sample: `avoid-user-interaction-in-transactions.good.al`.
+See sample: `avoid-recordref-in-hot-loop.good.al`.
 
 ## Anti Pattern
 
-Calling Confirm or StrMenu from inside an OnInsert, OnModify, or OnDelete trigger — or from any code path that has already started modifying records — blocks on user input while holding locks.
+`RecRef.Open(Database::Customer); if RecRef.FindSet() then repeat FldRef := RecRef.Field(Customer.FieldNo(Name)); ProcessName(FldRef.Value); until RecRef.Next() = 0;` — the table is fixed at compile time, the field is fixed at compile time, and the loop pays the dynamic-resolution cost on every iteration. The direct `Customer.Name` form does the same work without the lookup.
 
-See sample: `avoid-user-interaction-in-transactions.bad.al`.
+See sample: `avoid-recordref-in-hot-loop.bad.al`.
 
 
-# Blob fields are never cached — prefer Media or MediaSet for images
+# Do not Get the record the page already loaded
 
 ## Description
 
-`Blob` field contents are not cached by the Business Central server or the client. Every read re-fetches the full payload from the database, even when the same blob was read moments earlier in the same session. For images displayed on a page, this turns into a database round-trip per render.
-
-`Media` and `MediaSet` are purpose-built for this and behave differently in two ways that matter for performance. First, they are cached on the client, so subsequent renders of the same image do not re-hit the database. Second, the platform generates a thumbnail when the data is saved, so a list or card page can show the thumbnail immediately and lazy-load the full-resolution image — typically via a Page Background Task — only when needed.
-
-`Blob` remains appropriate for non-image binary data that is written once and rarely read, or for data the platform does not need to render. For any field that is displayed repeatedly — profile pictures, item images, logos on documents — `Media` or `MediaSet` is the default.
+A list or card page's `OnAfterGetRecord` trigger fires *because* the platform has already fetched a row into `Rec`. Calling `Get` for that same row inside the trigger repeats the read the platform just did. Per the upstream guidance, this is "redundant — record already fetched by page runtime"; the correction is "use `Rec` directly — already loaded." The waste compounds on list pages, where the trigger runs once per row displayed.
 
 ## Best Practice
 
-Store images in `Media` or `MediaSet` fields. Bind the thumbnail to the page; load full-resolution data asynchronously when the user opens the full view. Reserve `Blob` for opaque payloads that are not rendered in the UI.
+Inside page triggers — `OnAfterGetRecord`, `OnAfterGetCurrRecord`, validation triggers — read from `Rec` (or the trigger's record parameter). The platform exposes the freshly loaded record there for exactly this purpose. Reach for `Get` only when the trigger needs a *different* record than the one being displayed.
+
+See sample: `avoid-redundant-get-when-record-already-loaded.good.al`.
 
 ## Anti Pattern
 
-An Item Image field defined as `Blob` and shown directly on a list page. Every scroll re-fetches every image from SQL, the list page load time scales with row count and image size, and no client-side caching mitigates the cost.
+`AssemblyLineRec.Get("Document Type", "Document No.", "Line No.");` at the top of `OnAfterGetRecord`, when the trigger is on the `Assembly Line` page itself and `Rec` already holds that row. The pattern often appears when a helper that expects a record parameter is invoked from a page trigger and the author writes a `Get` to "freshen" `Rec` rather than passing `Rec` through.
+
+See sample: `avoid-redundant-get-when-record-already-loaded.bad.al`.
+
+
+# Do not hold locks while waiting for the user
+
+## Description
+
+A `Confirm`, `StrMenu`, modal page, or other user prompt issued from inside a write transaction stalls the transaction — and therefore every lock it holds — until the user responds. Per the upstream guidance, "Avoid user interactions (Confirm, StrMenu) inside transactions — they hold locks while waiting for user input." The wait is bounded only by the user; meanwhile other sessions block on whatever this transaction has acquired.
+
+## Best Practice
+
+Sequence the operation so user confirmation happens *before* any database write that takes a lock the prompt holds open. The shape is: ask the user → if confirmed, acquire locks and post. `if Confirm(...) then begin SalesHeader.LockTable(); SalesHeader.Get(DocNo); PostSalesOrder(SalesHeader); end;` keeps the lock window down to the work itself.
+
+See sample: `avoid-user-prompts-inside-transactions.good.al`.
+
+## Anti Pattern
+
+`SalesHeader.LockTable(); SalesHeader.Get(DocNo); if Confirm('Post this order?') then ...;` — the lock is held for as long as the dialog is up. A user who steps away to lunch holds the lock for an hour, and every other session that touches that row blocks for the duration.
+
+See sample: `avoid-user-prompts-inside-transactions.bad.al`.
+
+
+# Use CalcSums to aggregate, not CalcFields inside a loop
+
+## Description
+
+`CalcFields` materializes FlowField values for one record. Each call against a persistent table is "a separate SQL query"; running it inside a `repeat ... until Next() = 0` over a large table issues one query per row on top of the iteration itself. `CalcSums` answers the same aggregation question — "give me the sum of this FlowField over the filtered set" — as a single SQL statement. Per the upstream guidance, `CalcFields` inside loops on large persistent tables is "a performance problem"; the aggregation form is `CalcSums()`.
+
+## Best Practice
+
+When the procedure totals a FlowField (or several) across a filtered set, set the filters, then call `CalcSums("Field 1", "Field 2", ...)`. The platform issues one query; the result is read off the record's FlowField slot. Single `CalcFields` outside loops is fine, and `CalcFields` on the current row in a page's `OnAfterGetRecord` or in `OnValidate` is the standard pattern — those are per-action, not per-row over a large set.
+
+See sample: `calcsums-instead-of-calcfields-in-loop.good.al`.
+
+## Anti Pattern
+
+`if CustLedgerEntry.FindSet() then repeat CustLedgerEntry.CalcFields("Remaining Amount"); Total += CustLedgerEntry."Remaining Amount"; until CustLedgerEntry.Next() = 0;` — exactly the upstream-flagged shape. The iteration is the cheap part; the per-row `CalcFields` is what scales linearly with table size.
+
+See sample: `calcsums-instead-of-calcfields-in-loop.bad.al`.
 
 
 # Use Codeunit.Run to bound an atomic sub-operation
@@ -162,402 +234,301 @@ Inserting `Commit()` before each `Codeunit.Run` to silence the runtime error. Th
 See sample: `codeunit-run-requires-prior-commit-inside-transaction.bad.al`.
 
 
-# Combine multiple ModifyAll calls on the same recordset into a single pass
+# Do not LockTable in a read-only procedure
 
 ## Description
 
-`ModifyAll(Field, Value)` issues a SQL UPDATE against every row matching the record variable's current filters, setting one field. Calling it twice on the same filtered recordset — once per field to update — produces two separate UPDATE statements, each of which has to re-locate the matching rows through the index. On a ledger-entry-scale table with ten million rows and a filter that matches a thousand, the overhead is not a doubling of the update cost but a doubling of the more expensive row-location cost. A single `FindSet(true)` + set-by-set assignment + `Modify(false)` completes both field changes in one pass.
+`LockTable` is a transaction-wide signal: from the call onward, every read against that table in the same transaction acquires `UPDLOCK`. Per the upstream guidance, "`LockTable()` before Modify/Insert/Delete in the same procedure is the correct pattern" — locking the read against the write that follows is what the call exists for. The anti-pattern is "`LockTable()` in read-only procedures — unnecessary lock contention": the procedure never writes, but the lock cost is paid by everyone sharing the transaction.
 
 ## Best Practice
 
-When more than one field needs to change on the same filtered recordset, iterate once with `FindSet(true)` and assign all fields per row. Reserve ModifyAll for the case where a single field change covers the whole update. If the filter set is truly huge and the trigger behaviour differs between fields, consider splitting with concrete evidence — otherwise the single-pass loop wins.
+Reserve `LockTable` for the read directly before a `Modify`, `Insert`, or `Delete` that depends on the read value. If a helper is sometimes called for reading and sometimes for writing, split it into separate read and write paths and call `LockTable` only on the write path. For read-only existence checks or lookups, the right primitive is `ReadIsolation` (see `prefer-readisolation-over-locktable-for-reads.md`).
 
-See sample: `combine-multiple-modifyall-calls.good.al`.
+See sample: `do-not-locktable-in-read-only-procedure.good.al`.
 
 ## Anti Pattern
 
-Applying `SetRange` against `CustLedgerEntry` on `"Document No."` and then calling `ModifyAll("Accepted Payment Tolerance", ...)` followed by `ModifyAll("Accepted Pmt. Disc. Tolerance", false)` — two scans over the same filtered rows. On Cust. Ledger Entry with production-scale data the redundant second scan is the dominant cost.
+A pure getter that opens with `Rec.LockTable();`. Every caller's transaction now acquires `UPDLOCK` on that table for every subsequent read until commit. The contention shows up as blocking on unrelated sessions whose own code path looks innocent — the locker is invisible to the blocked reader.
 
-See sample: `combine-multiple-modifyall-calls.bad.al`.
+See sample: `do-not-locktable-in-read-only-procedure.bad.al`.
 
 
-# Do not flag performance on inherently bounded tables
+# Do not Modify inside OnAfterGetRecord
 
 ## Description
 
-Several categories of Business Central tables are so small, so rarely accessed, or so in-memory that performance heuristics that make sense on Item Ledger Entry produce noise when applied to them. Temporary records (`TableType = Temporary`, `SourceTableTemporary = true`) live in memory and any access pattern is fast. Singleton setup tables (`Sales & Receivables Setup`, `General Ledger Setup`, `*Setup` tables generally) hold one row per company. Small bounded tables — enum mappings, permission objects, Role IDs — count in the dozens. System metadata tables (`TableMetadata`, `Field`, `AllObjWithCaption`) are bounded by the object catalog. Admin, Migration, Setup, Wizard, and Hybrid* pages are used infrequently with small datasets.
+A list page's `OnAfterGetRecord` fires once per visible row, every time the user scrolls, sorts, or refreshes. A `Modify` inside that trigger means a database write per row displayed. Per the upstream guidance, "`Modify()` here means a DB write on every scroll. Use page variables for display-only state instead." `OnAfterGetCurrRecord` (single record on selection), `OnOpenPage`, and `OnInit` fire once or at much lower frequency and tolerate one-time setup logic.
 
 ## Best Practice
 
-Skip performance findings on these categories unless the code is specifically pathological (unbounded loop that multiplies cost non-linearly). A missing SetLoadFields on a singleton Setup table is not a finding. A Count on a 30-row permission mapping is not a finding. An admin page that iterates a bounded list once per invocation is not a finding. Reserving reviewer attention for the tables where it matters is half the value of the heuristics — noise on bounded tables trains authors to ignore the signal.
+When the trigger needs to compute display-only state per row, write the result into a page variable (a global on the page object) rather than back to the database. Reserve `Modify` for triggers that fire on an explicit user action — `OnAction`, validation triggers, `OnQueryClosePage` — where one action maps to one write.
+
+See sample: `do-not-modify-in-onaftergetrecord.good.al`.
 
 ## Anti Pattern
 
-Flagging `SalesReceivablesSetup.Get()` followed by `SetLoadFields()` on a handful of fields as "missing partial record optimization". Flagging a `FindSet` + loop on `Role ID` mapping because the loop has no SetCurrentKey. Flagging a Migration codeunit for writing many records, when the entire migration runs once per customer. All three burn author attention on cases that are not regressions.
+`trigger OnAfterGetRecord() begin Rec."Warning Flag" := CalcWarning(); Rec.Modify(); end;` — on a list page over a moderately sized table, scrolling through fifty rows produces fifty writes. The page feels slow, the table accumulates churn, and the warning flag — which is recomputed on every refresh anyway — never needed persistence.
+
+See sample: `do-not-modify-in-onaftergetrecord.bad.al`.
 
 
-# Do not Modify records inside OnAfterGetRecord
+# Removing SourceTableTemporary on an API page switches it from in-memory to persistent
 
 ## Description
 
-`OnAfterGetRecord` fires for every row the page or repeater renders. On a list page the user scrolls through, the trigger runs hundreds of times per second. A `Modify()` call inside the trigger writes to the database for every row scrolled past — the user's mouse wheel generates the write storm, and the effect compounds with every other subscriber that reacts to the OnModify event. The database activity is usually invisible to the author in development, because the list page loads ten rows; on a production tenant scrolling through thousands of rows, the page becomes the top source of write volume.
+`SourceTableTemporary = true` on a page makes the page's record buffer in-memory only — reads and writes do not touch SQL. The same applies to `TableType = Temporary` on a record. Removing either turns operations that were memory accesses into database round-trips. Per the upstream guidance, the change is "potentially increasing DB load for high-volume paths (API pages, background tasks)" — and on API pages especially, the change is invisible at the page definition but visible at production scale.
 
 ## Best Practice
 
-Derive display-only state into a page-level variable and bind that variable to the field control instead of writing to `Rec`. If the computed value is genuinely a stored attribute of the record, compute it once at the authoring site (OnValidate, OnInsert) and display the stored value on the list — do not recompute and rewrite on every render.
+If a page or record was declared temporary on purpose — to buffer payloads, accept synthetic rows, or expose computed data through an API surface without persisting it — keep it temporary. When removing the property looks necessary, audit the call sites first: a temporary API page is often consumed by integrations that issue many calls per minute, and the round-trip cost is paid per call. If persistence is genuinely required, weigh storage and lock cost against alternatives (a regular table the API page reads from, an event-driven write).
 
-See sample: `do-not-modify-records-in-onaftergetrecord.good.al`.
+See sample: `do-not-remove-sourcetabletemporary-from-api-page.good.al`.
 
 ## Anti Pattern
 
-An OnAfterGetRecord body that assigns a computed value to `Rec."Warning Flag"` and calls `Rec.Modify()` so the flag persists. The write fires per scroll, per user, per second — and every subscriber on the Rec's OnModify fires alongside.
+Dropping `SourceTableTemporary = true` from an API page to "simplify" it, without revisiting the access pattern. The page begins issuing real SQL on every request; locks now contend with other writers; bulk integrations slow proportionally. The same trap exists for a record that was `TableType = Temporary` and gets demoted to a persistent table to make a debugger view easier.
 
-See sample: `do-not-modify-records-in-onaftergetrecord.bad.al`.
+See sample: `do-not-remove-sourcetabletemporary-from-api-page.bad.al`.
 
 
-# Do not re-Get the current record inside OnAfterGetRecord
+# FindSet(true) applies UpdLock on the read; the two-parameter form is obsolete
 
 ## Description
 
-The page runtime loads the current record before firing `OnAfterGetRecord` — `Rec` already holds the row's values when the trigger body runs. Calling `Rec.Get(...)` (or any equivalent Get against the same key) inside the trigger issues a second database round-trip for data the runtime just fetched. On a list page that displays hundreds of rows during a scroll, this turns into hundreds of wasted round-trips per user interaction. The same concern applies to `OnAfterGetCurrRecord` on card and document pages, though the impact is smaller because the trigger fires per selection rather than per row.
+`FindSet()` and `FindSet(false)` are read-only — no locking. Per the upstream guidance, `FindSet(true)` "signifies the intent is to modify records" and "sets `ReadIsolation::UpdLock` on the record before finding rows." That is exactly the right shape when the loop body modifies each row: the read takes the same lock the modification will need, avoiding the deadlock window between an unlocked read and a later upgrade. The older two-parameter form `FindSet(ForUpdate, UpdateKey)` is obsolete — only the single-parameter signature should appear in new code.
 
 ## Best Practice
 
-Read from `Rec` directly. When a helper method needs a different record, pass `Rec` as an argument or let the helper fetch its own lookup once; do not re-Get the current row. If the code truly needs a fresh value because it was modified by another session, design the refresh explicitly — document it in a comment — rather than paying the cost on every trigger fire.
+Use `FindSet(true)` only when the loop body genuinely modifies the iterated rows; use `FindSet()` (or `FindSet(false)`) when the loop only reads. Do not write `FindSet(true, true)` or `FindSet(true, false)` — the two-parameter form is the obsolete signature.
 
-See sample: `do-not-re-get-rec-inside-onaftergetrecord.good.al`.
+See sample: `findset-true-applies-updlock-on-read.good.al`.
 
 ## Anti Pattern
 
-An `OnAfterGetRecord` trigger body that starts with `AssemblyLineRec.Get("Document Type", "Document No.", "Line No.")` for the same keys the page runtime has already used — the Get restates what `Rec` already holds. Replace with a direct call against `Rec` (`CheckAvailability(Rec)`).
+`FindSet(true)` on a loop that does not modify the iterated rows takes an `UpdLock` the work does not need; competing readers and writers stall against a lock the loop never uses. The mirror anti-pattern is `FindSet()` (no parameter) on a loop that *does* modify each row — the read takes a shared lock, the `Modify` then needs to upgrade, and the gap between them is a deadlock candidate.
 
-See sample: `do-not-re-get-rec-inside-onaftergetrecord.bad.al`.
+See sample: `findset-true-applies-updlock-on-read.bad.al`.
 
 
-# Do not retarget a FlowField's CalcFormula to a larger source table
+# A FlowField needs a source-table key that covers its CalcFormula
 
 ## Description
 
-A FlowField's CalcFormula is evaluated every time the field is read — every time the page renders, every CalcFields call, every list page filter that references the field. Changing the CalcFormula's source table from a smaller, bounded, or already-filtered table to a larger unfiltered one multiplies the per-read cost. A common shape is the refactor from "Posted X" to "X" — the unposted line table is typically an order of magnitude larger and carries rows that the original FlowField never considered. The change compiles and may look like a simple scope widening; the performance impact is not visible until production load.
+A FlowField is computed by SQL on demand. CodeCop AA0232 — "FlowFields should be indexed with SumIndexFields on corresponding keys" — captures the indexing requirement: the source table must declare a key that includes the fields the `CalcFormula` filters on, with the aggregated field listed in that key's `SumIndexFields`. When that alignment is in place, the platform answers `CalcFields`/`CalcSums` from SIFT; without it, the same query falls back to a row-by-row aggregation on what is often a ledger-scale table. Per the upstream guidance, "Missing SIFT indices cause performance issues on List pages."
 
 ## Best Practice
 
-When a FlowField CalcFormula changes source table, evaluate the before/after row counts, ensure a SIFT key exists on the new source that matches the formula's filters (see `add-sift-keys-for-flowfields`), and verify no existing callers rely on the tighter scope. If the widening is intentional, the corresponding SIFT keys on the new source must ship in the same PR.
+When introducing or changing a FlowField, walk the `CalcFormula`'s `WHERE` clause field by field and verify the source table has a key whose key fields cover those filters, with the aggregated field in `SumIndexFields`. The same applies when the destination side of the FlowField filter is a list-page column: the page filter triggers the FlowField on every visible row, and only SIFT keeps that affordable.
+
+See sample: `flowfield-source-key-needs-sumindexfields.good.al`.
 
 ## Anti Pattern
 
-Changing a `sum("Posted Expense Report Line"."Amount" where(...))` formula to `sum("Expense Report Line"."Amount" where(...))` without touching the source table's keys. Every list page and dashboard that reads the FlowField now aggregates over the unposted table too, almost always without a supporting SIFT key.
+A `sum` FlowField against a large source table with no matching SIFT key. Each calculation aggregates rows directly; on a ledger-sized source the FlowField becomes the slowest column on every page that displays it. Pointing an existing FlowField's `CalcFormula` at a larger source table without verifying the new source's keys is the same trap a step removed — the upstream review guidance flags it as "CalcFormula changed to larger source table".
+
+See sample: `flowfield-source-key-needs-sumindexfields.bad.al`.
 
 
-# Filter before you find
+# Guard event subscribers with cheap checks before any database call
 
 ## Description
 
-Every call to FindSet, Find, or FindFirst on an unfiltered record variable scans the entire table. On hot tables (ledger entries, value entries, sales invoice lines) a production dataset can easily be millions of rows, so the cost of forgetting a filter is orders of magnitude worse than the cost of applying one.
+Event subscribers fire on every event matching their signature — for `OnAfterValidateEvent` on a hot field like `Sales Line.Quantity`, that is every quantity edit by every user. Per the upstream guidance, "Keep event subscriber code lightweight" and "Avoid database operations in frequently-fired events — guard with cheap checks first." A `Get` or `FindFirst` at the top of such a subscriber pays a database round-trip on every fire, including the calls for which the subscriber's work was not needed.
 
 ## Best Practice
 
-Apply SetRange or SetFilter to narrow the record set before calling FindSet or Find. The filters should match a key on the table (see set-current-key-to-match-filters). When iterating rows that belong to a parent record, set all key-field filters before the find call — never inside the repeat loop.
+Open the subscriber with an in-memory predicate that filters out the calls the subscriber does not handle — record type, document type, status, parameter-passed flags. Only after the cheap guard passes should the body issue a database call, and only with `SetLoadFields` for the columns the body actually reads.
 
-See sample: `filter-before-find.good.al`.
+See sample: `guard-event-subscribers-before-db-call.good.al`.
 
 ## Anti Pattern
 
-Calling FindSet with no filters and then discarding rows inside the loop with an if-statement forces the platform to read every row of the table before your code even runs.
+`[EventSubscriber(...'OnAfterValidateEvent', 'Quantity', ...)] local procedure ... var Item: Record Item; begin Item.Get(Rec."No."); if Item.HasCustomPricing() then ...;` — `Item.Get` runs on every quantity change, including changes to lines whose `Type` is not `Item`. A pre-check `if Rec.Type <> Rec.Type::Item then exit;` ahead of the `Get` removes most of the calls.
 
-See sample: `filter-before-find.bad.al`.
+See sample: `guard-event-subscribers-before-db-call.bad.al`.
 
 
-# Place guard conditions before Get, not after
+# MaintainSQLIndex = false on a key disables SIFT for FlowFields that depend on it
 
 ## Description
 
-A `Record.Get(Key)` is a database round-trip. When the call site also contains an early-exit condition that may fire before the fetched record is used, the order of the two matters: `Get` first followed by a guard that may exit means every call pays the round-trip, including the calls that immediately return. Flipping the order — evaluate the guard first, `Get` only when needed — costs nothing in the happy path and turns the wasted round-trip into zero work on the exit path. The savings compound on hot tables and on code paths entered many times per user action.
+`MaintainSQLIndex = false` on a key tells the platform not to materialize that key as a SQL index. Per the upstream guidance, when a FlowField's source key carries that property, "SIFT cannot function, COUNT/SUM will table-scan." The flag is sometimes set to save write-path cost on a rarely-queried key, but if a `CalcFormula` aggregates through that exact key, the FlowField loses its index — every `CalcFields`/`CalcSums`/list-page filter that triggers it runs without one.
 
 ## Best Practice
 
-Evaluate cheap, in-memory conditions first. Only issue the `Get` (or `FindFirst`, `FindLast`) when the subsequent code actually needs the record's values. For complex procedures with multiple exit conditions, sort them cheapest-first: in-memory checks, then single-record lookups, then set iteration.
+When changing a key property to `MaintainSQLIndex = false`, find every FlowField whose `CalcFormula` filters on that key and verify another key covers the same fields. When adding a FlowField whose source table has only a `MaintainSQLIndex = false` key for its filter columns, add a fully-indexed key (or accept that the FlowField cannot ride SIFT and reshape the design — see `flowfield-source-key-needs-sumindexfields.md`).
 
-See sample: `guard-before-get-not-after.good.al`.
+See sample: `maintainsqlindex-false-breaks-flowfield-sift.bad.al`.
 
 ## Anti Pattern
 
-`PurchaseHeader.Get(PurchaseLine."Document Type", PurchaseLine."Document No."); if PurchaseLine."Selected Alloc. Account No." = '' then exit;` — the Get fires on every call; the exit discards the result for every call where `Selected Alloc. Account No.` is blank.
-
-See sample: `guard-before-get-not-after.bad.al`.
+A FlowField whose `CalcFormula`'s `WHERE` columns line up with a key that has `MaintainSQLIndex = false`. The schema looks correct — the key exists, the SumIndexFields are listed — but at runtime the platform has no SQL index to use, and the aggregation table-scans on every invocation.
 
 
-# Hidden FlowFields still calculate on pages
+# Use FindSet with repeat..Next; do not pair FindFirst/FindLast/Get with Next
 
 ## Description
 
-Setting `Visible = false` or `Enabled = false` on a FlowField hides the control but does not suppress the calculation. The server still runs the underlying CalcFields for every row the page renders. On a list page over a large table, the invisible column keeps consuming the same SQL as a visible one — the hiding is cosmetic only, and a diff that "turns off" an expensive FlowField by flipping `Visible` fixes nothing on the server.
-
-There are two correct remedies. The durable one is to remove the FlowField from the page or page-extension definition entirely — property toggles are not enough. The environment-level one, available where supported, is the **Calculate only visible FlowFields** feature in Feature Management; when enabled, the AL runtime skips calculation for non-visible FlowFields on pages. The feature is opt-in and administrator-controlled, so code cannot assume it is active.
+Two CodeCop rules carve out the loop pattern. AA0181 says `FindSet()`/`Find()` "must be used with `Next()` method" — these are the multi-row APIs that the runtime sets up for forward iteration. AA0233 says do "NOT use `FindFirst()`/`FindLast()`/`Get()` with `Next()`" — these are single-row APIs, and iterating from them "wastes CPU and bandwidth." Both rules together define one boundary: choose `FindSet` when the body iterates; choose `FindFirst`, `FindLast`, or `Get` when the body uses exactly one record.
 
 ## Best Practice
 
-Remove unused or hidden FlowFields from the page or page extension. If the field is needed for some users but expensive for others, factor into a dedicated page variant rather than hiding it in place. Do not rely on `Visible = false` as a performance fix unless the tenant has enabled the Calculate only visible FlowFields feature and that assumption is acceptable.
+When the body executes `repeat ... until Next() = 0;`, open the iteration with `FindSet()`. When the body needs one record and does not call `Next`, use `FindFirst`, `FindLast`, or — if the full primary key is known — `Get` (see `use-get-instead-of-findfirst-on-full-primary-key.md`). The choice is per call site, not a global preference.
+
+See sample: `pair-findset-with-next-loop.good.al`.
 
 ## Anti Pattern
 
-A performance PR that sets `Visible = false` on an expensive FlowField on a list page and claims the column no longer impacts load time. The control disappears from the UI, the CalcFields still runs for every row, and the list page stays slow.
+`if Customer.FindFirst() then repeat ... until Customer.Next() = 0;` — AA0233 flags this. The single-row API does not prepare the runtime for iteration, so the loop pays a cost the FindSet path does not. The mirror anti-pattern is calling `FindSet` to read a single record (see `use-isempty-for-existence-check.md` when only existence is required).
+
+See sample: `pair-findset-with-next-loop.bad.al`.
 
 
-# Keep event subscribers lightweight
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Pass false to Insert/Modify/Delete when the table triggers do not need to fire
 
 ## Description
 
-Event subscribers run synchronously on the publisher's thread. If a subscriber does heavy work — a database query, a web service call, a layout render — every caller of the publisher pays that cost. Subscribers on hot events (OnAfterValidate on common fields, OnBeforeInsert on ledger-entry-like tables) can multiply a small per-call cost into a system-wide regression.
+`Insert(true)`, `Modify(true)`, and `Delete(true)` run the table's `OnInsert`/`OnModify`/`OnDelete` trigger; the `(false)` form skips it. Per the upstream guidance, the trigger form should be used "only when needed" — every row whose write fires a trigger pays that cost, even when the trigger has nothing useful to add for the current call site. For tight bulk write paths the difference compounds linearly with row count.
 
 ## Best Practice
 
-Keep subscribers small: guard early with inexpensive checks, defer heavy work to a task queue or a background session, and cache results across invocations when the data is stable.
+Reach for the `(false)` form when the calling code already enforces the invariants the trigger would, or when the trigger is empty for the current table/extension. Use `(true)` when the trigger does work the caller depends on (number-series allocation, validation, cascading writes). Decide per call, not by code style: a default of "always `true`" makes bulk writes pay for triggers they did not need, and a default of "always `false`" silently skips validation the trigger was put there to enforce.
+
+See sample: `pass-false-to-insert-when-trigger-not-needed.good.al`.
 
 ## Anti Pattern
 
-Calling an external web service, running a report, or iterating a large table from inside an event subscriber on a hot publisher makes every operation on that publisher as slow as the heaviest subscriber.
-
-See sample: `keep-event-subscribers-lightweight.bad.al`.
+Looping over thousands of rows and calling `Modify(true)` on each, when the table's `OnModify` trigger does nothing relevant for the operation. The trigger cost is paid per row; the user-visible behavior is identical to the `(false)` form. The mirror is using `(false)` for an operation that depends on trigger-side defaulting and silently producing rows that fail downstream validation.
 
 
-# Keep OnCompanyOpen and OnCompanyOpenCompleted subscribers lightweight
+# Prefer a Dictionary over a temporary table for pure lookups
 
 ## Description
 
-`OnCompanyOpen` and `OnCompanyOpenCompleted` are raised every time a session is created — not only for interactive sign-ins, but also for every web service call, every job queue entry, every scheduled task, and every page background task. The session cannot run any AL code until every subscriber on these events has finished. Interactive users see a spinner; web service callers see elevated response times; background sessions sit idle waiting to start.
-
-Anything expensive in these subscribers is paid per session across the whole tenant. The two patterns that typically cause production incidents are outgoing HTTP calls to external services — which block AL execution until they complete (or time out) — and long-running SQL over large tables. An external service that is slow or unreachable turns into a tenant-wide sign-in outage, not a degraded feature.
-
-The code often looks harmless in review: a telemetry ping, a configuration refresh, a "just make sure the setup record exists" Get-or-Insert. Multiplied by session creations per minute, each of these becomes the critical path of sign-in.
+A temporary table supports a full record API — filters, iteration, multi-field keys — but a pure key→value lookup pays for plumbing it does not use. Per the upstream guidance, "if a temporary table record is ONLY used as a lookup table, it is faster to use a dictionary which supports O(1) lookups instead of O(lg n) for temporary tables." The Dictionary type has no record machinery to traverse; the key hash answers the lookup directly.
 
 ## Best Practice
 
-Keep `OnCompanyOpen` and `OnCompanyOpenCompleted` subscribers short and in-memory. Defer work that touches external services or large tables to a Page Background Task, a job queue entry, or a lazy first-use path. If an outgoing HTTP call in startup is truly unavoidable, set an aggressive timeout so a failing endpoint cannot stall session creation.
+When the use of a temp record is "set a key, see if the row exists, read a single value", switch to `Dictionary of [Key, Value]`. Use the temp-table form when the use genuinely needs filtering, iteration in a specific order, or a multi-field key. Compatibility with code that expects a `Record` parameter is a real reason to keep the temp table; performance alone, on a pure lookup, is not.
 
 ## Anti Pattern
 
-An `OnCompanyOpen` subscriber that calls an external licensing API over HttpClient without a tight timeout. When the endpoint is slow, every new session in the tenant — UI, API, background — waits on the HTTP call before it can run any AL.
+A temp `Record` declared, populated row by row, then queried with `SetRange(KeyField, X); if Find('=') then Value := Rec.ValueField;`. The lookup hashes the key behind the scenes and does the same work a `Dictionary` would, plus the per-row record overhead. The pattern often appears because the author originally needed iteration and the iteration was later removed without revisiting the data structure.
 
 
-# Do not remove SourceTableTemporary or TableType = Temporary without understanding the impact
+# Use ModifyAll / DeleteAll instead of per-row Modify / Delete in a loop
 
 ## Description
 
-`SourceTableTemporary = true` on a page, and `TableType = Temporary` on a table, mean the underlying record operates in memory — Insert/Modify/Delete mutate the session buffer, not the database. Removing either property converts the same operations to real SQL writes. On an API page that external callers hit at high frequency, on a background task that processes thousands of records, or on a UI page that composes an in-memory list for display, the change from temporary to persistent can turn a lightweight operation into a major source of database load. The refactor is easy to propose ("why is this temporary?") and expensive to regret.
+`ModifyAll` and `DeleteAll` are the bulk APIs. Per the upstream guidance, they "execute as single SQL statements" when the table supports it — one round-trip updates or deletes every row in the filtered set. The anti-pattern is the loop equivalent: `FindSet` followed by per-row `Modify`/`Delete`, where the runtime issues one write per row. On a production-scale table the difference is the difference between a single statement and N statements.
 
 ## Best Practice
 
-When a diff removes `SourceTableTemporary = true` or `TableType = Temporary`, require justification explaining why persistence is now required and what paths still write. Review the callers for unexpected new writes, transaction scope, trigger fires, and contention. Keep the property unless the change genuinely needs persistence; an unused-looking temporary table on a bounded page is usually there for a reason.
+When the loop body does nothing more than assign a constant value (or a value computed once) to one or more fields, replace the loop with `ModifyAll("Field 1", Value1)` — and chain additional `ModifyAll` calls for additional fields. The same shape applies to `DeleteAll`. Be aware that the bulk APIs can regress to row-by-row execution for tables with certain trigger or media-field configurations (see `triggers-and-media-field-regress-modifyall.md`); when that regression applies, multiple `ModifyAll` calls become more expensive than one manual loop, so the choice is conditional, not absolute.
+
+See sample: `prefer-modifyall-over-per-row-modify.good.al`.
 
 ## Anti Pattern
 
-A cleanup PR that deletes `SourceTableTemporary = true` from an API page "because the source table already exists". The API now writes to the real table on every call, every consumer's requests reach the database, and the incidental side-effects in the source table's triggers start firing across tenants.
+`if SalesLine.FindSet() then repeat SalesLine.Validate("Unit Price", NewPrice); SalesLine.Modify(true); until SalesLine.Next() = 0;` — N writes when one would do. The pattern is easy to introduce when the loop initially does per-row computation and is later simplified to assign a constant; the loop scaffolding survives the simplification.
+
+See sample: `prefer-modifyall-over-per-row-modify.bad.al`.
 
 
-# LockTable applies to the whole table for the rest of the transaction
+# Prefer ReadIsolation over LockTable for read-only scenarios
 
 ## Description
 
-`Record.LockTable` is commonly read as "lock this record variable", but it does not work that way. The call applies `WITH (UPDLOCK)` to every subsequent read against the underlying table in the current transaction, regardless of which record variable issues the read. If `ItemA.LockTable` runs, then an unrelated `ItemB` variable on `Item`, a `FindSet` from a helper codeunit on `Item`, and any nested code that reads `Item` all acquire UPDLOCK until the transaction commits.
-
-The consequence is that calling LockTable early in a transaction — for example at the top of a routine "to be safe" — upgrades every read of that table for the remainder of the transaction to a writer-blocking lock. Contention scales with transaction length, not with how many writes the code actually performs. A LockTable deep in a call graph can silently serialize readers that never touch the LockTable-ing variable.
+`LockTable` and `ReadIsolation` solve different problems with different blast radii. Per the upstream guidance, "`LockTable` ensures that all READS against that table will happen with UPDLOCK for the remainder of the transaction." `ReadIsolation` "only pertains to the current record instance, while `LockTable` affects the lockstate of the entire transaction." `ReadIsolation` is also more expressive: it can heighten or lower the isolation level inside an already-established transaction. Reaching for `LockTable` when only a single read needs guarding therefore poisons every later read on that table — including reads in other code paths that share the transaction.
 
 ## Best Practice
 
-Defer `LockTable` as late as possible and place it as close to the actual modification as you can. Keep transactions short so the UPDLOCK window is narrow. Do not add LockTable preemptively to "protect" a read that is not part of a read-modify-write sequence — the correct tool for read consistency is an isolation level (see Record.ReadIsolation), not a write lock.
+For a read-only operation, or a single read that needs a higher isolation level than the surrounding transaction, set `Rec.ReadIsolation := IsolationLevel::ReadCommitted;` (or the level the call requires) immediately before the read. The hint applies only to that record instance. Save `LockTable` for code that genuinely needs every subsequent read on the table to acquire an update lock (see `findset-true-applies-updlock-on-read.md` for the alternative narrower mechanism on iterated reads).
+
+See sample: `prefer-readisolation-over-locktable-for-reads.good.al`.
 
 ## Anti Pattern
 
-A procedure that calls `Rec.LockTable()` at the start "before doing anything" and then performs a long read-heavy validation before the eventual Modify. Every read in the validation now takes UPDLOCK on the whole table, and every other session that tries to read the same table waits on this transaction.
+`Rec.LockTable();` at the top of a helper that only reads, perhaps to "make sure the read is consistent". Every subsequent read on that table for the rest of the transaction acquires `UPDLOCK`, including reads from unrelated code paths fused into the same transaction. The contention surfaces in unrelated user sessions, not in the helper that introduced it.
+
+See sample: `prefer-readisolation-over-locktable-for-reads.bad.al`.
 
 
-# MaintainSQLIndex = false on a key disables SIFT for the FlowFields that depend on it
+# Production-scale tables warrant concrete performance analysis
 
 ## Description
 
-SIFT relies on the underlying SQL index being maintained by the platform. Setting `MaintainSQLIndex = false` on a key drops the SQL index without dropping the AL key declaration — the key compiles, FlowFields that reference its SumIndexFields compile, and CalcSums calls against matching filters compile. At runtime, however, the SIFT optimization silently cannot engage, and every aggregate falls back to a table scan. The symptom is a FlowField whose read time degrades linearly with row count, with no code-level signal pointing at the key property as the cause.
+Some Business Central tables routinely reach sizes where access patterns matter much more than they do on a generic table. The upstream review guidance lists ten of them with P95 row counts: Item (~800k), Customer (~800k), Item Ledger Entry (~10M), Value Entry (~10M), G/L Entry (~10M), VAT Entry (~10M), Customer Ledger Entry (~10M), Vendor Ledger Entry (~10M), Sales Invoice Header (~300k), and Sales Invoice Line (~3M). These figures are not platform constants — they are the volumes a reviewer should assume when judging a change.
 
 ## Best Practice
 
-Keep `MaintainSQLIndex = true` (the default) on any key whose SumIndexFields back a FlowField or that callers use with CalcSums. When a key is genuinely unused and the SQL index cost is the concern, remove the key entirely rather than leaving it in place with `MaintainSQLIndex = false`. If the FlowField is still needed, pick a different key that is maintained.
+For any code change that touches one of these tables, do not approve the pattern on intuition. Walk through the SQL the change implies (one query? one per row? one per chunk?), the memory it allocates (a `List` per row?), and the CPU work per row, against the row counts above. Smaller tables can tolerate a sub-optimal access pattern; these cannot. The rest of this domain — `apply-filters-before-iterating.md`, `use-setloadfields-for-partial-records.md`, `avoid-calcfields-in-loops.md`, `pair-findset-with-next-loop.md`, `avoid-get-inside-loop-on-persistent-tables.md` — exists primarily so that code touching these tables stays on the safe side of each rule.
 
 ## Anti Pattern
 
-A source-table key declared with `SumIndexFields` and `MaintainSQLIndex = false`, with a FlowField referencing those sum fields. The FlowField appears to work in development against small datasets and becomes a full table scan on production-scale data, with no error message and no obvious culprit in the code under review.
+Generalizing from a unit test or a development tenant. A `FindSet` loop with a per-row `CalcFields` may execute in milliseconds against a few thousand rows on a developer's machine and become a multi-minute table scan against ten million Value Entry rows in production. Reasoning about performance from the dev-tenant timing instead of the production volume is the single most common way a regression ships.
 
 
-# Only fetch records you use
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Pick a key whose fields cover the filter and sort with SetCurrentKey
 
 ## Description
 
-CodeCop rule AA0175 flags code that retrieves a record and then does not use it. Every Find, FindSet, FindFirst, FindLast, or Get has a cost: the platform reads rows from SQL, materializes them, and transports them to the AL runtime. A call whose result is never read is wasted work, and on hot tables that work is never free.
+The platform chooses a key for each record access. When the filters or required sort do not match the primary key — or any non-explicit choice — the query may run against a key that does not cover the filter columns. Per the upstream guidance, "Use `SetCurrentKey()` to select the most efficient key for your filters" and "match key fields to your filter/sort requirements." Filtering on fields that are not in any key is flagged as bad — there is no index to ride and the access ends up reading more than necessary.
 
 ## Best Practice
 
-Retrieve a record only when you need one or more of its field values. When you only need to know whether at least one row matches a filter, use IsEmpty (see use-isempty-for-existence-checks). When you only need a subset of fields, use SetLoadFields (see use-setloadfields-for-partial-records).
+When the access pattern is anything other than primary-key lookup, look at the filters and the desired sort, then either pick an existing key whose leading fields cover them and call `SetCurrentKey(...)`, or declare a new key on the table for the pattern. Match leading fields first — a key starting with `"Document Type", "Document No.", "Line No."` serves a filter on those three; a key starting with `"Line No."` does not.
 
-See sample: `only-fetch-records-you-use.good.al`.
+See sample: `setcurrentkey-aligns-key-with-filters.good.al`.
 
 ## Anti Pattern
 
-Calling FindSet or Get and then ignoring the result, or using it only as a boolean existence test, performs the full fetch and throws the data away.
-
-See sample: `only-fetch-records-you-use.bad.al`.
+Applying filters on fields that no key indexes, leaving the platform to read more than it should. The query produces the right answer; the cost surfaces only at production volume. The mirror case is forgetting `SetCurrentKey` when the wanted sort differs from the primary key — the iteration may then be sorted in memory after a wider read than necessary.
 
 
-# Prefer direct record access over RecordRef where possible
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Singleton setup tables hold one row; access-pattern optimization is wasted
 
 ## Description
 
-RecordRef and FieldRef are the platform's reflection API: they work across tables the compiler does not know at authoring time. That flexibility costs per-operation overhead — every field access goes through a lookup — and loses compile-time type checking. For operations where the table is known, a strongly-typed Record variable is simpler and faster.
+Business Central setup tables — `Sales & Receivables Setup`, `General Ledger Setup`, `FA Setup`, `Purchases & Payables Setup`, and the broader pattern of any `*Setup` table — hold at most one record per company. Per the upstream guidance, "any access pattern is fine, no `SetLoadFields` needed" on these tables. The same applies to other small bounded tables (enum mappings, permission objects, Role IDs) and system metadata tables (`TableMetadata`, `Field`, `AllObjWithCaption`) where iteration is safe.
 
 ## Best Practice
 
-Use Record variables for code paths that target a known table. Reach for RecordRef and FieldRef only when the table is genuinely dynamic (generic export/import, field-agnostic utilities, cross-table integrations).
-
-Only flag RecordRef usage as a performance concern when it appears inside a **hot, unbounded loop** — typically iterating over ledger-entry-scale tables (10,000+ rows) — where a strongly-typed Record alternative exists. RecordRef in bounded contexts, one-off operations, admin tools, setup helpers, or wizard code is not a performance concern and should not be flagged.
-
-See sample: `prefer-direct-record-over-recordref.good.al`.
+Skip access-pattern optimization on singleton-setup-style tables. `SalesReceivablesSetup.Get()` does not need `SetLoadFields` (see `use-setloadfields-for-partial-records.md`); a `repeat ... until` over a permission-object table does not need bulk operations. Spend the review attention on the production-scale tables instead (see `production-scale-tables-warrant-extra-analysis.md`).
 
 ## Anti Pattern
 
-Using RecordRef as a habit, even when the target table is hardcoded two lines earlier, costs performance and hides intent from reviewers.
-
-See sample: `prefer-direct-record-over-recordref.bad.al`.
+Mechanically applying the rules in this domain to every `Record` variable in the codebase. Flagging "missing `SetLoadFields`" on `GeneralLedgerSetup` or "use `IsEmpty` instead of `FindSet`" on a setup table adds noise without payoff — the optimization saves nothing measurable on a one-row table — and trains readers to ignore the review channel.
 
 
-# Prefer Get for primary-key lookups
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Temporary tables are in-memory; access-pattern rules do not apply
 
 ## Description
 
-Get is a direct primary-key lookup: one index seek, one row, done. FindFirst with SetRange on the primary key fields reaches the same row through a more general code path and carries the overhead of filter setup and a broader optimizer decision.
+A record declared `Temporary` (or a page with `SourceTableTemporary = true`) lives entirely in memory; reads and writes never reach SQL. Per the upstream guidance, "any access pattern (FindSet, FindFirst, Get, loops) on temp tables is acceptable — they are in-memory and fast." The rules in the rest of this domain — partial loading, bulk operations, N+1 detection, `IsEmpty` over `Count` — exist to avoid database round-trips that a temporary table does not perform.
 
 ## Best Practice
 
-When the complete primary key is known, call Get. Use FindFirst only for non-primary-key lookups or when the filter is a partial prefix of the key.
-
-See sample: `prefer-get-for-primary-key-lookups.good.al`.
+Recognize the `Temporary` property (on a record variable, table declaration, or page's `SourceTableTemporary`) and exempt the code from access-pattern flags. The `SetLoadFields`/`FindSet` discipline that matters for `Customer` does not matter for a temporary `Customer` variable used as a working set. The interesting performance question on a temp table is volume in memory, not query plan.
 
 ## Anti Pattern
 
-Setting one SetRange per primary-key field and then calling FindFirst reproduces Get with more typing and slightly worse performance.
-
-See sample: `prefer-get-for-primary-key-lookups.bad.al`.
+Flagging a temporary table's `FindFirst` inside a loop, or a temporary table without `SetLoadFields`, as a performance issue. The recommendation produces no measurable gain and obscures genuine issues elsewhere in the same review.
 
 
-# Query objects bypass the primary-key cache and always hit SQL
+# Triggers, subscribers, and media fields can silently regress ModifyAll / DeleteAll
 
 ## Description
 
-The Record API reuses a server-side primary-key cache: repeated reads of the same rows within a session or request can be served from memory without going to SQL. Query objects do not participate in that cache. Every execution of a query goes to the database, even when the same rows were just read through a Record variable in the same transaction.
-
-This inverts the usual intuition that queries are always faster than record loops. Queries win when they exploit a covering index, aggregate, or join multiple tables in SQL that AL would otherwise loop. They lose when the data is small, already cached, or read repeatedly in a short window — the per-call SQL round-trip dominates.
-
-Query objects also cannot write, cannot be backed by a page, and do not see the records a temp-table-backed AL flow has inserted but not committed. Choose them for set-based reads over indexed data, not as a generic replacement for the Record API.
+`ModifyAll` and `DeleteAll` usually execute as single SQL statements, but the platform falls back to a fetch-then-row-by-row loop under specific conditions. Per the upstream guidance, the regression is triggered by any of: global database triggers defined via `GetGlobalTableTriggerMask` or `GetDatabaseTableTriggerSetup` (so that `OnDatabaseDelete`/`OnGlobalDelete` must run); event subscribers on the table's `OnBeforeDelete`/`OnAfterDelete` (for `DeleteAll`) or `OnBeforeModify`/`OnAfterModify` (for `ModifyAll`); or "adding a Media or MediaSet table field to either the table or table extension." Each of these forces the platform to materialize each affected row in AL.
 
 ## Best Practice
 
-Use a query object when the shape of the work is genuinely set-based: aggregation, multi-table join, or a large read that benefits from a covering index. For hot single-record or small-result reads — especially lookups that will repeat in the same request — prefer the Record API so the primary-key cache does its job.
+Before introducing any of the above on a table — a global trigger registration, a `Modify`/`Delete` subscriber, a media or media-set field — note every `ModifyAll`/`DeleteAll` that targets the table and assess whether the regression cost is acceptable. The upstream guidance is explicit: "There should be a very good reason for doing any of the above since they will significantly regress performance of `ModifyAll` and/or `DeleteAll`." Once a table has regressed, multiple `ModifyAll` calls each iterate the rows themselves, so consolidating to one explicit `FindSet`+`Modify` loop becomes faster than chaining several `ModifyAll` calls.
 
 ## Anti Pattern
 
-Replacing a `Get` or a short filtered `FindSet` inside a frequently-called helper with a query object "for performance". Every caller now pays a SQL round-trip that the Record API cache had been absorbing, and the helper gets slower under load, not faster.
-
-
-# Set the current key to match your filters
-
-> Contributions welcome — open a PR to refine or extend this article.
-
-## Description
-
-AL chooses a key for a Find call based on the current SetCurrentKey selection. When filters do not align with any key, the platform either scans or falls back to a less selective index. On tables with production-scale row counts, this is the difference between an index seek and a table scan.
-
-## Best Practice
-
-Call SetCurrentKey with the fields you filter and sort on, in the order they appear in a table key. If no suitable key exists, add one via a table extension rather than relying on an unsupported filter pattern.
-
-See sample: `set-current-key-to-match-filters.good.al`.
-
-## Anti Pattern
-
-Setting many filters on fields that no key covers, and leaving the key selection to the platform's heuristics, produces non-deterministic performance that degrades as the table grows.
-
-
-# SetLoadFields pays off at scale; skip it on narrow tables and short loops
-
-## Description
-
-`SetLoadFields` reduces the number of columns the platform hydrates per record. It delivers real savings on wide tables with blob, media, or many text fields when the iteration touches a small subset. Below certain thresholds the accounting flips the other way: narrow tables (fewer than ~10 fields) save almost nothing per row, and short loops (fewer than ~10 iterations) amortize the narrowing over too few fetches to outweigh the extra code and the specification-and-access-set coupling that future edits have to maintain. Recommending SetLoadFields on every Find/Get call produces low-value churn and invites the opposite mistake — listing a field in SetLoadFields and then forgetting to access it, which triggers a second round-trip to load the missing field.
-
-## Best Practice
-
-Reach for SetLoadFields when the table is wide (10+ fields, especially with blobs) AND the code path reads a small subset AND the iteration or fetch count is material. When in doubt on a short loop over a narrow table, leave SetLoadFields out; the complexity cost is not earned. The filter-only-field rule from `omit-filter-only-fields-from-setloadfields` still applies: fields used only in filters stay out of the list.
-
-## Anti Pattern
-
-A 5-row loop over a 6-field setup table prefaced by `Rec.SetLoadFields(...)`. The author has added two lines of code, coupled the loop to a field specification that needs to be updated on every schema change, and saved nanoseconds. The same pattern applied mechanically to every Find call in a codebase produces hundreds of diffs that do not move the performance needle.
-
-
-# Split read-only and write paths so LockTable runs only when needed
-
-## Description
-
-LockTable takes an exclusive write lock on the affected table for the remainder of the transaction. In a helper that is called from many read-only sites and a few write sites, placing LockTable unconditionally at the top serializes every reader on every other reader's lock — the helper becomes a system-wide contention point. The correct shape is a conditional structure: try the read-only path first, and only fall through to LockTable when the code genuinely needs to modify the table.
-
-## Best Practice
-
-For paths that are read-only, prefer `ReadIsolation` over `LockTable`. Setting `Rec.ReadIsolation := IsolationLevel::ReadCommitted` on a record variable gives fine-grained, per-instance control over the isolation level without taking an update lock on the table for the rest of the transaction. Use `LockTable` only for paths that genuinely write to the table.
-
-For helpers that may or may not modify records, factor the code so readers return immediately without a lock and only writers reach the LockTable call. A common pattern: attempt `Rec.Get()` first; if it returns the row, exit with the value; otherwise LockTable and proceed with the Insert. Document the pattern in a comment on the helper so callers understand why the LockTable is inside a branch.
-
-See sample: `split-read-only-and-write-paths-to-avoid-locktable.good.al`.
-
-## Anti Pattern
-
-A `GetOrCreate` helper that unconditionally calls `Rec.LockTable()` at the top, then Gets the row, then returns it. Every reader now blocks every other reader even though none of them intend to write. Under load the helper becomes the dominant bottleneck.
-
-See sample: `split-read-only-and-write-paths-to-avoid-locktable.bad.al`.
-
-
-# Table event subscribers force ModifyAll and DeleteAll to run row-by-row
-
-## Description
-
-`ModifyAll` and `DeleteAll` normally compile to a single set-based SQL UPDATE or DELETE. That optimization is conditional: if any subscriber is bound to the table's modify or delete events — `OnBeforeModifyEvent`, `OnAfterModifyEvent`, `OnBeforeDeleteEvent`, `OnAfterDeleteEvent`, and their Rec counterparts — the server must invoke AL per affected row so the subscriber sees each record. The operation falls back to a row-by-row loop, one SQL statement per row, inside the same transaction.
-
-The slowdown is invisible in the caller's source: the call site still reads as a bulk operation. It only shows up under load, and adding an apparently cheap subscriber (even an empty one, or one that guards on a condition and returns) is enough to trigger the fallback for every caller of ModifyAll/DeleteAll on that table across the system. Central tables — Item Ledger Entry, G/L Entry, Sales Line — are the worst places to attach such subscribers because every extension's bulk operation pays the cost.
-
-## Best Practice
-
-Before subscribing to a table's modify or delete events, consider whether the logic can live elsewhere — on the triggering action, on a specific OnValidate, or on a business-event publisher. If the subscriber is unavoidable, scope it as narrowly as possible and document that it forces row-by-row execution so future maintainers understand the cost. Watch PRs that add such subscribers to heavily-modified tables.
-
-## Anti Pattern
-
-An empty or nearly-empty `OnAfterModifyEvent` subscriber on `Sales Line` added as a placeholder for future integration. Every `ModifyAll` on `Sales Line` — in the base app, in every extension, in every tenant — now runs one SQL UPDATE per row.
-
-
-# Treat ledger-entry and line-type tables as production-scale when reviewing performance
-
-## Description
-
-A handful of Business Central tables grow to millions of rows in production tenants: Item Ledger Entry, Value Entry, G/L Entry, VAT Entry, Customer Ledger Entry, Vendor Ledger Entry, Sales Invoice Line, Purchase Invoice Line, Detailed Cust. Ledg. Entry, Detailed Vendor Ledg. Entry, and equivalent line-type tables. Master-data tables like Customer, Vendor, and Item typically reach the high hundreds of thousands. A performance review that treats these tables with the same latitude as setup tables or small reference lists under-reports real regressions; the same filter-or-key mistake that is invisible on a 50-row table is a full table scan over millions of rows on these.
-
-## Best Practice
-
-When a code change touches any of the above tables, demand concrete performance reasoning before accepting it: an appropriate key selection, a SetLoadFields narrowing, filters that use the key prefix, no N+1 inside the iteration. A finding on one of these tables should almost never be downgraded from High to Low on the grounds that "the operation looks small" — at production scale the operation is never small.
-
-## Anti Pattern
-
-Applying review heuristics uniformly to all tables. A missing SetCurrentKey on a Setup table changes nothing; the same mistake on Item Ledger Entry turns a list page into a multi-second load. The asymmetry is the whole point of the catalog — knowing which tables warrant the stricter read.
+Adding a media field to a hot table — or subscribing to its modify/delete events from a generic logging codeunit — without auditing the bulk-write call sites. The schema change is mechanical; the performance change is invisible at the call site and only surfaces when a previously fast `ModifyAll` starts paying the per-row trigger cost in production. The mirror anti-pattern is chaining several `ModifyAll` calls on a table that has already regressed; each one re-iterates the same rows.
 
 
 # AL auto-commits when code execution completes
@@ -575,202 +546,76 @@ Default to no explicit `Commit()`. Let the runtime open and close the transactio
 Sprinkling `Commit()` defensively — at the end of a procedure, after every Modify, or "just to be safe" — reflects a SQL-style mental model that does not apply here. Every stray Commit shortens the rollback window: work before the Commit survives later errors the developer almost certainly intended to unwind. A Commit without a specific reason is a bug waiting to surface.
 
 
-# Uninstall the test framework to measure insert performance
+# Use Get when the full primary key is known; FindFirst is the wrong tool
 
 ## Description
 
-Business Central's server uses a bulk insert optimization that batches multiple row inserts into a single SQL round-trip when conditions allow. When the test framework is installed on the environment, that optimization is disabled — inserts fall back to one SQL statement per row. The behavior is a side-effect of how the test framework instruments AL execution and applies whether or not any test is actually running.
-
-For functional tests this is invisible; for performance measurement it is catastrophic. A benchmark that inserts ten thousand rows with the test framework present reports a number that has nothing to do with production, because production will not run in row-by-row mode. Treating the measurement as a real baseline produces conclusions that are wrong by a large constant factor.
-
-The same caveat applies to Update and Delete paths where bulk optimizations exist — the test framework's presence suppresses them.
+`Get(...)` is the direct primary-key lookup. `FindFirst()` walks an index — even when narrowed by `SetRange` on every primary-key field. The upstream review guidance treats `Customer.SetRange("No.", CustomerNo); if Customer.FindFirst() then ...` as a bad pattern and `if Customer.Get(CustomerNo) then ...` as the correction. The two reach the same record; only `Get` expresses the lookup as a primary-key seek.
 
 ## Best Practice
 
-Before running any insert, update, or delete throughput benchmark — whether via the Performance Toolkit, a hand-rolled harness, or `SessionInformation` assertions — uninstall the test framework from the target environment. Re-install it only for functional test runs. Document this step in the benchmark procedure so future measurements are comparable.
+When all primary-key fields are available at the call site, call `Get` (or `GetBySystemId`) with them. Reserve `FindFirst` for cases where the filter is on something other than the full primary key — a unique secondary field, a partial composite key, a sort that the caller cares about.
+
+See sample: `use-get-instead-of-findfirst-on-full-primary-key.good.al`.
 
 ## Anti Pattern
 
-A performance regression report comparing two builds on a sandbox that has the test framework installed. Both numbers are row-by-row timings; the ratio between them may be meaningful, but neither number reflects production, and any absolute throughput claim derived from the run is wrong.
+Composing `SetRange` calls that exactly cover the primary key and then calling `FindFirst`. The result is correct but the call site reads as "search the table" rather than "look up by key", which obscures both the intent and the access pattern from later reviewers.
+
+See sample: `use-get-instead-of-findfirst-on-full-primary-key.bad.al`.
 
 
-# Use AddLoadFields in report dataitems
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Use IsEmpty for existence checks, not Count() or FindFirst()
 
 ## Description
 
-Reports iterate a dataitem's record automatically; the developer does not control the Find call directly. AddLoadFields, called in OnPreDataItem, tells the platform which fields the layout and the dataitem triggers will read. Without it the report streams every field of every row — for a ledger-entry dataitem on a production tenant, that is the dominant cost of the report.
+When the caller only needs to know whether any row matches a filter, `IsEmpty()` is the API designed for the question. Per the upstream guidance, "`IsEmpty()` is more efficient as it stops at first record found." `Count() > 0` materializes a count the caller does not need; `FindFirst()` materializes a row the caller does not need. Both do work that `IsEmpty` does not.
 
 ## Best Practice
 
-In each dataitem's OnPreDataItem trigger, call AddLoadFields for every field used by the layout, by the dataitem's triggers, and by any code that runs in the row-level event hooks. If the layout uses a FlowField, also ensure CalcFields is called and that the underlying key is loaded (see add-sift-keys-for-flowfields).
+Phrase existence checks as `if not Record.IsEmpty() then ...` (or `if Record.IsEmpty() then ...` for the negative). Apply filters via `SetRange`/`SetFilter` before the call so the existence check runs against the intended subset. Reserve `Count` for cases where the actual number matters and `FindFirst` for cases where the record fields are read.
 
-See sample: `use-addloadfields-in-report-layouts.good.al`.
+See sample: `use-isempty-for-existence-check.good.al`.
 
 ## Anti Pattern
 
-Omitting AddLoadFields is the default for reports generated by the AL wizard. For a dataitem backed by a ledger-entry table, this silently turns the report into a full-column scan.
+`if Customer.Count() > 0 then ...` and `if Customer.FindFirst() then ...` (when the record is discarded) — both are flagged by the upstream guidance as the wrong tool. The first asks the database for the full count; the second asks for a row's fields. Both answers go unused.
+
+See sample: `use-isempty-for-existence-check.bad.al`.
 
 
-# Use CalcSums to aggregate filtered sets
-
-> Contributions welcome — open a PR to refine or extend this article.
-
-## Description
-
-When the task is to compute a sum over a filtered set, CalcSums lets the platform push the aggregation down to SQL using SIFT indexes. Iterating rows in AL to accumulate a total transports every row's data to the runtime only to discard it after adding one field. On ledger-entry-scale tables this difference is dramatic. The same SIFT infrastructure backs Sum-style FlowFields; when the value you need is already declared as a FlowField, calling CalcSums on the underlying table with the correct filters produces the same aggregate.
-
-## Best Practice
-
-Set the required filters on the record, then call CalcSums on the field you want aggregated. Ensure the table has a key whose SumIndexFields includes the summed field and whose key prefix matches the filters (see add-sift-keys-for-flowfields).
-
-See sample: `use-calcsums-for-flowfield-totals.good.al`.
-
-## Anti Pattern
-
-Looping a filtered set with FindSet and adding a field to an accumulator on every iteration performs work in AL that SQL already knows how to do in one aggregate query.
-
-See sample: `use-calcsums-for-flowfield-totals.bad.al`.
-
-
-# Use FindSet in read-only mode by default
+# Use SetLoadFields to load only the fields the code reads
 
 ## Description
 
-FindSet has two modes: FindSet() and FindSet(false) are read-only and take no write lock; FindSet(true) calls LockTable before fetching. Write locks are expensive and hold for the remainder of the transaction, so passing `true` when you do not intend to modify the records increases contention under load.
+`SetLoadFields(...)` declares the subset of normal fields the next read should materialize, "reducing data read and transfer thereby improving performance significantly." Per the upstream guidance, "the gains scale with the amount of rows read, so for loops that read many rows `SetLoadFields` is even more important." Primary-key fields, `SystemId`, and system audit fields are loaded automatically, "and fields that are filtered on are also automatically included" — those do not need to appear in the list. `SetLoadFields` only affects `FieldClass = Normal`; it does not narrow FlowFields or FlowFilters.
 
 ## Best Practice
 
-Call FindSet with no arguments when the loop only reads field values. Pass `true` only when the same loop is expected to call Modify, Delete, or Rename on the record, and the correctness of the operation depends on the table being locked for the full iteration.
-
-See sample: `use-findset-readonly-by-default.good.al`.
-
-## Anti Pattern
-
-Writing FindSet(true) reflexively for every iteration forces the platform to take a LockTable on every call, even when the loop only reads values. The older two-parameter signature `FindSet(ForUpdate, UpdateKey)` is obsolete and must not be used.
-
-See sample: `use-findset-readonly-by-default.bad.al`.
-
-
-# Use FindSet with Next for iteration
-
-> Contributions welcome — open a PR to refine or extend this article.
-
-## Description
-
-When iterating over a filtered set of records with repeat-until, use FindSet together with Next. CodeCop rule AA0181 requires FindSet or Find to be paired with Next; using FindFirst or FindLast as the loop starter misrepresents intent and leads to rule AA0233.
-
-## Best Practice
-
-Call FindSet to start the iteration and Next to advance. Guard the loop with the standard `if FindSet() then ... until Next() = 0` idiom so callers can still handle the empty-set case.
-
-See sample: `use-findset-with-next.good.al`.
-
-## Anti Pattern
-
-Starting a repeat-until loop with FindFirst or FindLast reads only one row and then calls Next on an iterator that was not intended for full-set traversal. The platform pays extra work to fetch the single row and the loop silhouette is misleading to reviewers.
-
-See sample: `use-findset-with-next.bad.al`.
-
-
-# Choose Insert, Modify, and Delete parameters deliberately
-
-> Contributions welcome — open a PR to refine or extend this article.
-
-## Description
-
-Insert, Modify, and Delete accept a boolean that controls whether the table's OnInsert / OnModify / OnDelete trigger fires. Running the trigger for scratch or migrated data is often unnecessary work — side effects, posting rules, validations — for rows that were already validated upstream. Running the trigger when application logic depends on it is non-negotiable.
-
-## Best Practice
-
-Call Insert(true), Modify(true), or Delete(true) when the table's trigger logic is part of the operation's semantics. Call Insert(false), Modify(false), or Delete(false) when the operation is bulk data movement or temporary-table manipulation and the trigger would duplicate work or fire invalid side effects.
-
-See sample: `use-insert-false-when-skipping-triggers.good.al`.
-
-## Anti Pattern
-
-Blindly passing `true` everywhere pays for triggers on rows that do not need them. Blindly passing `false` silently skips validations that the table's author intended to be mandatory.
-
-
-# Use IsEmpty for existence checks
-
-> Contributions welcome — open a PR to refine or extend this article.
-
-## Description
-
-IsEmpty is the cheapest way to answer whether at least one row matches the current filters. It short-circuits at the first match and never hydrates a record. Count() scans and counts the entire set; FindFirst fetches a full row just to be discarded.
-
-## Best Practice
-
-Use `if not Rec.IsEmpty() then ...` for existence checks. Reserve Count for cases where the exact number of rows is needed, and FindFirst for cases where you actually want the row's field values.
-
-See sample: `use-isempty-for-existence-checks.good.al`.
-
-## Anti Pattern
-
-`if Rec.Count() > 0` iterates the whole set just to answer a yes/no question. `if Rec.FindFirst() then` loads an entire row of data the caller never reads.
-
-See sample: `use-isempty-for-existence-checks.bad.al`.
-
-
-# Use SetLoadFields for partial records
-
-## Description
-
-SetLoadFields instructs the platform to hydrate only the listed fields on a record variable. On wide tables, or tables with BLOB or media fields, the difference is substantial: a Sales Invoice Line has dozens of fields and loading all of them for every row of a large set is wasted bandwidth. Primary key fields, SystemId, and system audit fields are always loaded automatically. SetLoadFields works only with FieldClass = Normal; FlowFields and FlowFilters cannot be partial-loaded.
-
-## Best Practice
-
-Call SetLoadFields before FindSet, FindFirst, or Get whenever the code path only reads a subset of fields. List every field that is read or written during the operation, including fields used in calculations and downstream function calls. Omitting a field that is later accessed triggers a second round-trip.
-
-Fields that appear **only** in SetRange or SetFilter calls do not need to be included — the database resolves the filter using the index without hydrating the value into AL memory. Including filter-only fields wastes bandwidth and is not required.
+Before a `Get`, `FindSet`, or `FindFirst` that the procedure follows by reading only a handful of the table's fields, call `SetLoadFields` listing exactly those fields. The pattern `SetLoadFields(...); if Record.Get(...) then ...` is the upstream-endorsed shape. Skip `SetLoadFields` when the table has few fields (under ten), when the code reads most of them (above 60 %), when the loop runs ten or fewer iterations, or when the table is exempt for other reasons (`singleton-setup-tables-need-no-access-optimization.md`, `temporary-tables-have-no-database-cost.md`). For report dataitems, use `AddLoadFields` in `OnPreDataItem` instead (see `addloadfields-in-report-onpredataitem.md`).
 
 See sample: `use-setloadfields-for-partial-records.good.al`.
 
 ## Anti Pattern
 
-Iterating a large set and reading only two or three fields without SetLoadFields forces the platform to transport every column for every row, including BLOBs and unused text fields.
+Loading a wide table and reading one field per row in a loop. The bytes transferred per row are dominated by the columns the procedure does not touch; the SQL query selects them anyway. The same applies to a single `Get` on a wide table — the platform reads the whole row when a single field would have sufficed.
 
 See sample: `use-setloadfields-for-partial-records.bad.al`.
 
 
-# Use SingleInstance codeunits for session caching
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Use TextBuilder for many string concatenations, especially inside loops
 
 ## Description
 
-A SingleInstance codeunit lives once per session. Variables on it survive across calls, which makes it the natural home for data that is expensive to compute, read often, and stable for the duration of the session — feature flags, configuration snapshots, setup records. Each cached value avoids a SQL read per subsequent call site.
+AL `Text` is immutable: each `Result += Piece;` allocates a new buffer and copies the previous content into it. Inside a loop the work is quadratic in the number of pieces. `TextBuilder` is the AL primitive designed for the pattern — per the upstream guidance, "Use `TextBuilder` when concatenating many strings together (for example inside loops)." Its `Append` mutates a growable internal buffer; `ToText()` materializes the final string once at the end.
 
 ## Best Practice
 
-Store long-lived, read-often, rarely-changing data on a SingleInstance codeunit, populated lazily on first access. Keep the cached footprint small: a handful of booleans, a setup record, a few derived values. Be explicit about invalidation if the source can change during the session.
-
-See sample: `use-single-instance-codeunits-for-caching.good.al`.
+When a procedure assembles a string from many fragments — joining row data into a CSV, accumulating a log buffer, formatting a multi-line message inside a loop — declare a `TextBuilder` local, call `Append` per fragment, and call `ToText()` after the loop. For a fixed number of small fragments, `StrSubstNo` remains the right tool; the rule targets the loop case.
 
 ## Anti Pattern
 
-Reading the same setup record on every call from every caller, instead of caching it, repeats a SQL round-trip that has no business happening more than once per session.
-
-
-# Use temporary tables for intermediate data
-
-> Contributions welcome — open a PR to refine or extend this article.
-
-## Description
-
-Temporary tables live in memory, not in SQL. They are the correct primary data structure for intermediate results, working sets, and lookup caches that do not need to outlive the current operation. Using a real persisted table for scratch data incurs database round-trips, transaction scope, and locking for data that has no business being persisted.
-
-## Best Practice
-
-Declare the record variable with `temporary` when the data is scratch. Populate it with Insert(false) to avoid firing triggers. Clear the table explicitly with DeleteAll when the variable's scope is long-lived (a SingleInstance codeunit or a reused session variable) and needs to be reset between uses.
-
-See sample: `use-temporary-tables-for-intermediate-data.good.al`.
-
-## Anti Pattern
-
-Writing intermediate results to a real table, processing them, and deleting them afterwards performs the full cost of INSERT and DELETE operations on data that never needed to be transactional.
+`if Customer.FindSet() then repeat Csv += Customer."No." + ',' + Customer.Name + '\n'; until Customer.Next() = 0;` — every iteration reallocates and copies the entire string built so far. On a few hundred customers the cost is invisible; on the production-scale table list (`production-scale-tables-warrant-extra-analysis.md`) it dominates the loop.
 
 
 # Use [TryFunction] for error catching, Codeunit.Run for atomic rollback
@@ -794,197 +639,317 @@ Wrapping database writes in `[TryFunction]` expecting the writes to roll back wh
 See sample: `use-tryfunction-for-error-catching-not-rollback.bad.al`.
 
 
-# DataClassification is a table-field property, not a page property
+# Do not pre-build an error string with `StrSubstNo` before calling `Error()`
 
 ## Description
 
-DataClassification governs how the platform handles a field's data in telemetry, data-subject requests, and retention tooling. It is declared on the table field, not on the page that displays the field. Pages — card pages, list pages, API pages — simply render fields sourced from a table. A privacy issue with classification is always an issue on the table definition; the page is a display surface.
+`StrSubstNo` returns a plain `Text` value with the substitutions already performed. When that result is then passed to `Error()`, the platform sees a single plain-text parameter with no field references left to inspect, so it cannot apply `DataClassification` to anything inside it. Whatever PII the `StrSubstNo` call interpolated — customer name, e-mail, address, error text — is logged verbatim to telemetry. This is the canonical way to accidentally leak customer data through error telemetry, and it is the only `Error()` shape that needs to be flagged.
 
 ## Best Practice
 
-Flag missing or wrong DataClassification on the table field where the data lives. When a field is exposed through an API page or any other page type, the source table's classification governs. Do not report the same issue on every page that happens to include the field.
+Call `Error()` directly with the format string and the substitution parameters. The platform classifies each parameter individually and handles telemetry correctly even when the parameters are PII fields (see `error-direct-substitution-safe-for-telemetry.md`). If the message text needs to be a `Label`, pass the `Label` and the parameters to `Error()` — do not pre-render via `StrSubstNo`.
+
+See sample: `avoid-strsubstno-prebuild-before-error.good.al`.
 
 ## Anti Pattern
 
-Reporting a privacy finding on `page 50100 "Customer API"` because it exposes an email field, rather than on `table Customer`'s email field. Fix at the source; the page is not the offender and the same correction applied per-page produces churn without changing the data-classification story.
+Assigning `StrSubstNo('Customer %1 (%2) ...', Customer.Name, Customer."E-Mail")` to a `Text` variable and then calling `Error(ErrorMsg)`. The platform has nothing to classify by the time `Error` runs — the PII is baked into the string and goes straight to telemetry. Detection signal for a reviewer: any `Text` variable assigned from `StrSubstNo` and later passed as the *only* parameter to `Error()`.
+
+See sample: `avoid-strsubstno-prebuild-before-error.bad.al`.
 
 
-# Do not move PII or secrets from IsolatedStorage to plain table fields
+# DataClassification is a table-field property, not a page-field property
 
 ## Description
 
-IsolatedStorage with SetEncrypted keeps sensitive values — tokens, URLs carrying identifiers, delta cursors with embedded user context — encrypted at rest and scoped to the extension. Moving the same value to a normal table field is a refactor that looks structural but is a privacy and security regression: the value is now plaintext in SQL, visible to every reader of that table, backed up and replicated as ordinary business data. Reviews of existing integrations frequently see this change justified as "easier to query" — the concern is the storage model, not the ergonomics.
+`DataClassification` is defined on table fields. Pages — including `Card`, `List`, `API`, and `ListPart` — do not own a classification; they simply expose fields whose classification is inherited from the underlying table. A page-level `DataClassification` property does not exist, so neither a missing nor a "wrong" classification can be reported against a page. When the underlying table field is misclassified, the fix is on the table definition, not on every page that surfaces the field.
 
 ## Best Practice
 
-Keep tokens, secrets, personal-context URLs, and similar sensitive values in IsolatedStorage (SetEncrypted) or Azure Key Vault. When a refactor moves the value, require an explicit justification and a mitigating control (restricted-read permission set, value-level encryption, redaction in the access path). Otherwise leave it where it was.
-
-See sample: `do-not-move-pii-from-isolated-storage-to-plain-fields.good.al`.
+When reviewing a page that exposes a field believed to be under-classified, follow the field back to its source table and inspect (or correct) the `DataClassification` there. A single corrected table field propagates to every page, report and API that uses it.
 
 ## Anti Pattern
 
-A diff that deletes an `IsolatedStorage.SetEncrypted` call and writes the same value into a new `Text` column on a business table. The value is now unencrypted, unscoped, and indistinguishable from non-sensitive content to any caller reading the table.
-
-See sample: `do-not-move-pii-from-isolated-storage-to-plain-fields.bad.al`.
+Flagging a page (or trying to add a `DataClassification` property to a page field) because the page displays personal data. Pages display data that authenticated, permissioned users are already entitled to see; the classification belongs on the table field that stores the data, not on the UI that renders it.
 
 
-# Error logs to telemetry; Message, Confirm, and Notification do not
+# DataClassification is required on table fields containing sensitive data
 
 ## Description
 
-The privacy concern with user-facing text is not what the authenticated user sees — it is what the platform exports to telemetry. Error is captured automatically; Message, Confirm, StrMenu, and Notification are not. Reviews that flag PII in any user-facing dialog over-report. Reviews that ignore PII in Error under-report. The distinction is the delivery surface, not the presence of a person's name on screen.
+`DataClassification` is the AL property that tells the platform what kind of data a table field stores so that telemetry, GDPR data-subject requests, and the platform's audit surfaces can treat it correctly. It is required on any field that holds personal or customer data. The default value `SystemMetadata` means "no user or customer data" — applying it to a field that actually holds PII (an email address, a customer name, an employee code) is an under-classification and a privacy bug, even though the code still compiles.
 
 ## Best Practice
 
-Free-text business content — customer names, email addresses, document numbers — is acceptable in Message, Confirm, and Notification. Treat Error text as if it will be read by telemetry consumers, because it will be. Use localized Labels with the fewest possible PII placeholders, or system identifiers (SystemId, primary key values) rather than personal data.
+Set `DataClassification` to the value that matches the data the field actually stores. A `Customer."E-Mail"`-style field is `CustomerContent` (data belonging to the tenant's customers); a personal identifier such as an employee number or user ID is `EndUserIdentifiableInformation` or `EndUserPseudonymousIdentifiers` depending on whether it is directly identifying. Choose the classification at field definition time — fixing it later is a schema change.
 
-See sample: `error-is-logged-to-telemetry-message-is-not.good.al`.
+See sample: `data-classification-required-on-pii-fields.good.al`.
 
 ## Anti Pattern
 
-Embedding customer emails, phone numbers, addresses, or names directly into Error strings — either as literals or via pre-built StrSubstNo output — because "the user will see this anyway." The user also sees Message and Confirm, but those are not logged. Error is.
+Declaring a field that stores PII with `DataClassification = SystemMetadata` to silence the compiler warning. The field compiles but the platform now treats customer data as system metadata in telemetry, GDPR exports and admin reports.
 
-See sample: `error-is-logged-to-telemetry-message-is-not.bad.al`.
+See sample: `data-classification-required-on-pii-fields.bad.al`.
 
 
-# FlowFields and FlowFilters automatically inherit DataClassification SystemMetadata
+# `Error()` with direct substitution parameters is always safe for telemetry
 
 ## Description
 
-FlowFields and FlowFilters are virtual — they carry no stored data of their own, and their values are computed on demand from the source table the CalcFormula references. The platform classifies them as SystemMetadata automatically and does not require (or respect) a per-field DataClassification declaration. Flagging a FlowField as missing DataClassification, or as under-classified because the computed value may be CustomerContent, is a false positive: the underlying source field carries the classification that matters, and that is what telemetry and compliance tooling inspects.
+When `Error()` is called with a format string and direct substitution parameters (`%1`, `%2`, …), the BC platform intercepts the call, inspects each parameter individually, and applies the `DataClassification` of the source field — stripping or masking sensitive data before writing the message to telemetry. This is true regardless of whether a parameter is a record field reference, a local variable, a function return value, or any other expression. Patterns such as `Error('Invalid email: %1', Customer."E-Mail")` are therefore safe even when the parameter is PII: the platform sees `Customer."E-Mail"` as a `CustomerContent` field reference and handles it correctly.
 
 ## Best Practice
 
-Leave DataClassification off FlowFields and FlowFilters. If the computed value is sensitive, the fix is to ensure the source table's field has the correct classification. Verify source-field classification rather than trying to re-classify the computed view.
+Pass values to `Error()` as direct substitution parameters — either inline or via a `Label` with `Comment = '%1 = …'` placeholders. Let the platform do the per-parameter classification. This works equally well for record fields, local text variables, and document IDs.
+
+See sample: `error-direct-substitution-safe-for-telemetry.good.al`.
 
 ## Anti Pattern
 
-Reporting "missing DataClassification" on a FlowField, or attempting to set a FlowField's DataClassification to CustomerContent because the SUM aggregates a sensitive amount. The declaration has no effect; the platform uses the source-field classification.
+Treating any `Error()` call that mentions PII as a leak. A review skill that flags `Error('Invalid email: %1', EmailAddress)` is wrong; the platform handles that pattern correctly. The only `Error()` shape that genuinely leaks PII to telemetry is the pre-built `StrSubstNo` form covered in `avoid-strsubstno-prebuild-before-error.md`.
 
 
-# In-memory variables are not a privacy concern in Business Central
+# Only `Error()` is logged to telemetry — `Message`, `Confirm`, `Notification` are not
 
 ## Description
 
-Business Central runs in a managed server environment. Local variables, Dictionary, List, and temporary Record buffers exist only for the duration of the request or session; the runtime reclaims them when the scope exits. Memory dumps are not a realistic threat vector in this architecture, and flagging an in-memory collection of customer emails or names as a privacy issue misstates the product's security model.
+The privacy concern with dialog APIs is not what the signed-in user sees on the screen — it is what the platform writes to telemetry. The BC platform automatically captures `Error()` invocations in the telemetry stream; it does not capture `Message()`, `Confirm()` or `Notification` calls. That asymmetry is the reason privacy review focuses on `Error()` text and ignores the other dialog APIs: a `Message` that shows a customer's email to the signed-in user reveals nothing they were not already entitled to see, while an `Error` carrying the same email leaks it to a separate, longer-lived telemetry destination.
 
 ## Best Practice
 
-Focus privacy review on persistence, transit, and telemetry: what is written to tables, sent over the network, or logged. Treat in-memory handling of personal data as normal business functionality. When an in-memory buffer is copied into IsolatedStorage, a table, or a telemetry call, that downstream write is what gets reviewed.
+Treat `Error()` as a telemetry surface, not just a UI surface — review the message text and parameters with the same scrutiny you apply to `Session.LogMessage`. Treat `Message()`, `Confirm()`, and `Notification` as pure UI: showing business data the user is permissioned for is normal functionality.
 
 ## Anti Pattern
 
-Flagging `Dictionary of [Code[20], Text]`, `List of [Text]`, or `Record Customer temporary` variables that hold customer data during a calculation as a privacy concern. The flag is a false positive that trains authors to avoid a normal pattern and distracts from the persistent storage that does matter.
+Flagging `Message`/`Confirm`/`Notification` calls for "showing PII" — they are not logged to telemetry, and the user already has permission to the underlying data. The inverse anti-pattern is treating `Error()` as harmless because the user sees only a dialog: the message is also written verbatim to telemetry.
 
 
-# Override inherited DataClassification when a field doesn't fit the table default
+# `FeatureTelemetry` `CustomDimensions` follow the same privacy rules as `Session.LogMessage`
 
 ## Description
 
-When a table declares `DataClassification` at the table level, every field inherits that value unless the field declares its own. This is efficient for homogeneous tables — a SystemMetadata log table whose fields are all system-generated, a CustomerContent transaction table whose fields are all business data. It is a privacy regression when a table is classified SystemMetadata but contains a field that holds personal data: the field silently inherits the wrong classification, and telemetry tooling treats its content as safe to log when it is not.
+`Codeunit "Feature Telemetry"` is the second telemetry surface in AL. Its methods — `LogUsage()`, `LogUptake()` and `LogError()` — each accept a `CustomDimensions` dictionary parameter whose contents are sent to telemetry as-is. The platform does not classify per-dimension values for you, so any customer or employee data placed into the dictionary is logged verbatim. The privacy rules that apply to `Session.LogMessage` message text apply to every value in `CustomDimensions`: no customer or employee names, email addresses, phone numbers (`CustomerContent`/EUII); no employee codes, user IDs or user security IDs (EUPI); no user-provided content (addresses, descriptions, notes); no `GetLastErrorText()` output.
 
 ## Best Practice
 
-Review every field on a table with a table-level DataClassification. Fields whose content matches the table's default need no per-field declaration. Fields that carry a different kind of data — a customer name on an otherwise-system-metadata log table, a personal identifier on a mixed-content table — must declare their own DataClassification that overrides the table default.
+Pass only non-personal context through `CustomDimensions` — feature names, status enums, counts, error codes, durations. For uptake or usage signals that do not need per-call context, prefer the parameterless overload of `LogUptake`/`LogUsage` over a `CustomDimensions` dictionary that risks accreting PII over time.
 
-See sample: `override-inherited-dataclassification-per-field.good.al`.
+See sample: `featuretelemetry-customdimensions-no-pii.good.al`.
 
 ## Anti Pattern
 
-A table declared `DataClassification = SystemMetadata` with fields like `Customer Name`, `E-Mail`, `Phone No.` — the fields inherit SystemMetadata, which is wrong for CustomerContent. Subject-access-request and retention tooling treats the personal data as system housekeeping.
+`CustomDimensions.Add('EmployeeNo', ExpenseHeader."Employee No.")` followed by `FeatureTelemetry.LogUsage(...)` — the employee number is a pseudonymous user identifier (EUPI) and is now in telemetry. Same pattern with `'UserName'`, `'CustomerEmail'`, `'AttachmentName'` etc.
 
-See sample: `override-inherited-dataclassification-per-field.bad.al`.
+See sample: `featuretelemetry-customdimensions-no-pii.bad.al`.
 
 
-# Pages displaying data to permitted users are not a privacy concern
+# FlowFields and FlowFilters are classified `SystemMetadata` automatically
 
 ## Description
 
-Every page in Business Central displays data to an authenticated user who holds the permissions required to see it. The permission system — table permissions, entitlements, field-level restrictions where configured — is the access-control boundary. Flagging a page for showing customer emails, names, addresses, document numbers, or system audit fields treats display as a leak when it is the product's intended function.
+`FlowField` and `FlowFilter` are not stored fields — a FlowField is computed from a CalcFormula at read time and a FlowFilter is a transient filter scoped to the record variable. Because nothing is ever written to the database for these fields, the platform automatically classifies them as `DataClassification = SystemMetadata` and AL does not require — or expect — the developer to set `DataClassification` on them. A FlowField that surfaces PII (e.g., a sum or lookup over a `CustomerContent` table) is still `SystemMetadata` at the FlowField level; the privacy classification lives on the underlying stored field that the CalcFormula references.
 
 ## Best Practice
 
-Privacy review of pages is about data classification on the source table and about consent on outgoing integrations reached through page actions. Displaying business data to a user with permission to view it is correct behaviour, including on API pages that are gated by the same permission model.
+Do not declare `DataClassification` on `FieldClass = FlowField` or `FieldClass = FlowFilter` fields — the inherited `SystemMetadata` is correct and the property is redundant. If a FlowField exposes sensitive data, ensure the underlying source field has the right `DataClassification`; that is where the platform reads classification from for GDPR and telemetry purposes.
+
+See sample: `flowfield-flowfilter-classification-systemmetadata.good.al`.
 
 ## Anti Pattern
 
-Reporting "customer email is shown on the page" or "user ID visible in the list" as privacy findings. The finding does not reflect a privacy regression and redirects the author toward hiding data that the permitted user is entitled to see. The same logic produces noise on Confirm, Message, and Notification that surface business identifiers.
+Flagging a FlowField for "missing `DataClassification`" or trying to override it to `CustomerContent` because the formula references customer data. The platform's automatic `SystemMetadata` value is the documented, intentional behavior for non-stored fields; overriding it adds nothing and misrepresents the field as if it were stored.
 
 
-# Check Privacy Notice consent before outgoing requests with customer data
+# Treat `GetLastErrorText()` as potential customer content
 
 ## Description
 
-Business Central ships a Privacy Notice framework for user consent to third-party integrations. When code sends personal data (emails, names, addresses) to an external service, the concern is not whether the data itself is compliant — the product handles that — but whether the code path has verified the user has agreed to the integration. Missing consent checks on new or modified outgoing paths is the privacy issue to flag; the presence of PII in the payload is not.
+`GetLastErrorText()` returns the text of the last error that occurred in the context where it is called. That text routinely contains customer content — field values that triggered the validation, record keys, customer names, file names from upload failures, and similar fragments lifted from the failing operation. Re-emitting it through `StrSubstNo` into `Error()` bakes that customer data into a single plain-text parameter that the platform can no longer classify, so it is logged verbatim to telemetry (the same problem as any other `StrSubstNo`-pre-built error — see `avoid-strsubstno-prebuild-before-error.md`).
 
 ## Best Practice
 
-Before an outgoing HttpClient call that carries customer data, verify consent via `Codeunit "Privacy Notice".GetPrivacyNoticeApprovalState()` for the integration's registered notice id. The check may live upstream (page OnOpenPage, wizard step) as long as every path that reaches the external call passes through it. Register new integrations via `Codeunit "Privacy Notice Registrations"`.
+When the goal is to surface a recoverable failure to the user, raise a generic message that does not embed `GetLastErrorText()` content, and log technical detail separately via `Session.LogMessage` with the correct `DataClassification`. If you must propagate the inner error verbatim, re-raise it as a direct parameter of `Error()` (e.g., `Error('%1', GetLastErrorText())`) rather than concatenating with `StrSubstNo` so the platform can apply its own handling.
 
-See sample: `require-privacy-notice-consent-before-outgoing-requests.good.al`.
+See sample: `getlasterrortext-customer-content-in-errors.good.al`.
 
 ## Anti Pattern
 
-Adding or modifying an outgoing integration and sending customer data without any `Privacy Notice` check in the reachable code path. Removing an existing consent check from an integration that still sends data externally falls in the same category.
+`ErrorMsg := StrSubstNo('Attachment failed: %1', GetLastErrorText(true)); Error(ErrorMsg);` — the inner error text may carry filenames or record values, and `StrSubstNo` strips the platform's ability to filter them before they hit telemetry.
 
-See sample: `require-privacy-notice-consent-before-outgoing-requests.bad.al`.
+See sample: `getlasterrortext-customer-content-in-errors.bad.al`.
 
 
-# Sanitize GetLastErrorText before sending to telemetry
+# In-memory variables, dictionaries, lists and temporary tables are not a privacy concern
 
 ## Description
 
-`GetLastErrorText` and `GetLastErrorCallStack` return strings built from the failing call site's data — field values, record keys, customer names, filenames. Logging either to telemetry with `DataClassification::SystemMetadata` misstates the content: the actual values are CustomerContent or worse. The true classification is not always SystemMetadata, and silently mislabelling a CustomerContent payload as system data is the specific privacy regression to avoid.
+AL runs in a managed server environment. Local variables, `Dictionary`, `List`, temporary `Record` variables, and other in-process data structures exist only for the duration of the request or session and are released by the runtime when it ends — they are not persisted, not visible across sessions, and not exposed outside the server process. Memory dumps are not a realistic threat vector against Business Central's hosted architecture, so holding business data (emails, names, addresses, document content) in these structures while processing a request is normal and expected.
 
 ## Best Practice
 
-Log a generic error message and either omit GetLastErrorText entirely or classify the telemetry call as `DataClassification::CustomerContent`. Prefer `GetLastErrorText(false)` to exclude the call stack when the text is needed but the stack is not. When in doubt, log a generic summary and persist the detailed error separately in a restricted-access log the telemetry pipeline does not receive.
-
-See sample: `sanitize-getlasterrortext-before-telemetry.good.al`.
+Use whatever in-memory shape (`Dictionary`, `List`, temporary tables, plain variables) the algorithm needs. The privacy review applies to *persistent* surfaces — table fields, telemetry, outgoing HTTP — not to per-request memory.
 
 ## Anti Pattern
 
-`Session.LogMessage(..., StrSubstNo('Operation failed: %1', GetLastErrorText(true)), ..., DataClassification::SystemMetadata, ...)` — the classification is wrong for the payload, and the call stack typically carries customer data from the failing operation into the telemetry stream.
-
-See sample: `sanitize-getlasterrortext-before-telemetry.bad.al`.
+Flagging a `Dictionary of [Text, Text]` populated with customer emails, or a temporary `Record Customer` holding rows mid-processing, as a privacy leak. These structures are scoped to the request and do not leave the server's memory.
 
 
-# Specify DataClassification on every telemetry call and keep PII out of the message
+# In data migration code, classify the destination — not the migration itself
 
 ## Description
 
-`Session.LogMessage` accepts a DataClassification parameter that governs how the platform handles the logged content in the telemetry pipeline. Omitting it is a schema violation the platform cannot repair later. Embedding personal data — emails, names, phone numbers, addresses, filenames of user uploads — in the message string also defeats classification, because the pipeline sees opaque text and cannot selectively redact.
+Migration codeunits such as `HybridSL`, `HybridGP`, and `HybridBC` exist to copy sensitive data — TINs, Federal IDs, social security numbers, financial records — from a source system into Business Central. The fact that PII flows through these codeunits is the entire point of their existence, not a defect. The privacy concern is whether the destination field where the data lands carries the correct `DataClassification`. If it does, the migration is doing its job; if it doesn't, the right fix is on the destination table field, never on the migration code that writes to it.
 
 ## Best Practice
 
-Pass DataClassification explicitly on every Session.LogMessage call. Keep the message a generic, non-identifying sentence and place structured values in custom dimensions where the classification applies per key. Business identifiers (Customer No., Document No., Vendor No.) are acceptable as dimensions; free-text personal data is not.
-
-See sample: `specify-dataclassification-on-every-telemetry-call.good.al`.
+When reviewing a migration codeunit, trace each `Dest."<Field>" := Source."<Field>"` assignment to the destination field's `DataClassification`. Confirm that fields receiving PII (SSNs, Federal IDs, customer names, addresses) are classified `EndUserIdentifiableInformation` or `CustomerContent` as appropriate — and not left as `SystemMetadata` or `ToBeClassified`.
 
 ## Anti Pattern
 
-`Session.LogMessage('0001', StrSubstNo('Customer %1 processed', Customer.Name), Verbosity::Normal, DataClassification::SystemMetadata, TelemetryScope::All)` — the declared classification is SystemMetadata but the message carries CustomerContent. The payload is logged with the wrong tag; downstream consumers treat it as safe when it is not.
-
-See sample: `specify-dataclassification-on-every-telemetry-call.bad.al`.
+Flagging the migration code itself for "processing sensitive data" or recommending that it filter, hash, or skip PII fields — these tables exist to migrate that data. The actionable finding is always on the destination field's classification, not on the migration's assignment statement.
 
 
-# Pre-building Error text with StrSubstNo defeats platform PII stripping
+# Do not embed customer data in the telemetry message text
 
 ## Description
 
-Error messages are captured by platform telemetry. When Error receives a format template and field references as substitution arguments (Error('... %1 ...', Customer."No.")), the platform inspects each field's DataClassification and omits sensitive values from telemetry automatically. When the caller pre-builds the message with StrSubstNo and then passes the resulting Text to Error, the platform sees a plain string with no field context and logs the whole thing verbatim — any PII already baked in is exported to telemetry.
+`Session.LogMessage`'s message argument is a plain `Text`. Unlike `Error()`, the platform does not inspect this string field-by-field — whatever is in the text is what telemetry receives. So a call that builds the message via `StrSubstNo` from customer-bearing fields ships those values to telemetry verbatim, regardless of the `DataClassification` argument on the same call. Flagged content includes customer names, email addresses, phone numbers, addresses, employee codes or IDs, attachment filenames, user-provided text that may carry PII, and dumps of `Record` content.
 
 ## Best Practice
 
-Pass the template and the field references directly to Error. Declare the template as a Label with a Comment describing each placeholder. The platform's field-aware classification logic then takes care of what reaches telemetry.
+Keep the telemetry message a static, non-personal string ("Customer record processed", "Error processing uploaded file"). When structured context is genuinely needed, attach it through custom dimensions, where individual values can be reviewed and classified at the dimension level rather than baked into a free-text message.
 
-See sample: `strsubstno-prebuild-breaks-error-telemetry-classification.good.al`.
+If a pseudonymous identifier (record `No.`, primary key value) genuinely belongs in the diagnostic, prefer attaching it through a custom dimension and set the call's `DataClassification` to match the data actually shipped — `EndUserPseudonymousIdentifiers` for pseudonymous IDs, `CustomerContent` for content-bearing telemetry. Changing the `DataClassification` alone does **not** make embedding a customer name into the message string acceptable; the data still ships in the message, and downstream consumers still see the literal string.
+
+See sample: `no-pii-in-telemetry-message-string.good.al`.
+
+## Related
+
+- `session-logmessage-requires-dataclassification.md` — every `Session.LogMessage` call must specify `DataClassification`; choose the value to match the actual data shipped, not the value that makes the entry retained the longest.
+- `featuretelemetry-customdimensions-no-pii.md` — custom dimensions are the right surface for structured context, but they have their own PII rules.
 
 ## Anti Pattern
 
-Assigning the output of StrSubstNo to a Text variable and passing that variable to Error. Every substituted value is now part of an opaque string; the platform cannot classify it and logs everything.
+`Session.LogMessage('0000', StrSubstNo('Processed %1', Customer.Name), ...)` — the customer name is in telemetry the moment the line runs. Detection signal: a `StrSubstNo` whose result is the second argument of `Session.LogMessage`. The same shape with `FileName`, `EmployeeCode`, or any record field is the same problem.
 
-See sample: `strsubstno-prebuild-breaks-error-telemetry-classification.bad.al`.
+See sample: `no-pii-in-telemetry-message-string.bad.al`.
+
+
+# Displaying fields on a page (or in a UI dialog) is not a privacy concern
+
+## Description
+
+Every page in Business Central — `Card`, `List`, `API`, `ListPart`, request pages — renders data to an authenticated user who has been granted permission to see it. The BC permission system, not the page definition, controls who sees what; once a user is permissioned to a table, displaying any field of that table is normal business functionality. The same logic extends to `Message`, `Notification` and `Confirm` dialogs: the signed-in user already has access to the data the dialog is showing them. Privacy review for pages and dialogs is therefore the wrong layer — the actionable findings live on the underlying data (table-field classification, telemetry message text, outbound HTTP consent), not on the UI.
+
+## Best Practice
+
+When asked "is it OK to show this email/name/employee code on this page?", the answer is yes — provided the user has permission to the underlying record. Drive privacy concerns to the data layer (classification, telemetry, external transfer) rather than the UI layer.
+
+## Anti Pattern
+
+Flagging an API page, list, card, or notification for surfacing customer-bearing fields (`E-Mail`, `Name`, `Phone No.`, audit fields, `User ID`). The permission system governs visibility; the page does not.
+
+
+# Outgoing requests to external services require a Privacy Notice consent check
+
+## Description
+
+Business Central ships a built-in Privacy Notice framework that the admin uses to grant or withhold per-integration consent for sending data to external services. The relevant API surface is `Codeunit "Privacy Notice"` (consent checks via `GetPrivacyNoticeApprovalState()`), `Codeunit "Privacy Notice Registrations"` (well-known notice IDs for integrations such as Exchange, OneDrive, Teams), and the `Enum "Privacy Notice Approval State"` with values `Agreed`, `Disagreed`, and `Not Set`. The admin UI is the **Privacy Notices Status** page. The compliance concern in code review is therefore not that personal data is included in an outgoing HTTP body — that is normal business functionality — but that the code path issuing the request contains no `PrivacyNotice.GetPrivacyNoticeApprovalState(...)` check.
+
+## Best Practice
+
+Before issuing an outgoing HTTP request to an external service, verify `PrivacyNotice.GetPrivacyNoticeApprovalState(<integration id>) = "Privacy Notice Approval State"::Agreed`. The check does not have to live next to the `HttpClient.Post` call — it can sit anywhere upstream in the same code path (for example in the page's `OnOpenPage`, in a wizard step, or in a setup action) as long as no execution path reaches the request without passing through it.
+
+See sample: `privacy-notice-consent-for-external-data-transfer.good.al`.
+
+## Anti Pattern
+
+A `procedure SendDataToExternalService(...)` that posts customer data to an external endpoint with no `PrivacyNotice.GetPrivacyNoticeApprovalState` anywhere upstream. The same anti-pattern applies in reverse: removing an existing privacy-notice check from code that still issues the external call.
+
+See sample: `privacy-notice-consent-for-external-data-transfer.bad.al`.
+
+
+# Register every new external integration with `Privacy Notice Registrations`
+
+## Description
+
+`Codeunit "Privacy Notice Registrations"` is the registry of integrations whose consent state the platform tracks. Built-in integrations such as Exchange, OneDrive and Teams already have notice IDs exposed via accessor methods on this codeunit (`GetExchangePrivacyNoticeId`, etc.); a new integration introduced by an extension must add itself to the registry so that the admin can grant or withhold consent on the **Privacy Notices Status** page. Without registration, there is nothing for `Codeunit "Privacy Notice"` to return an approval state for — the call cannot meaningfully gate the outbound request.
+
+## Best Practice
+
+When introducing a new outbound integration: pick a stable notice ID, register it via `Privacy Notice Registrations`, and then gate every outbound call with `PrivacyNotice.GetPrivacyNoticeApprovalState(<that id>)` as described in `privacy-notice-consent-for-external-data-transfer.md`.
+
+See sample: `register-integration-in-privacy-notice-registrations.good.al`.
+
+## Anti Pattern
+
+Shipping a new outbound integration without registering it. Even if the code calls `GetPrivacyNoticeApprovalState`, the admin has no surface to express consent — the integration is effectively unmanaged from a privacy-notice standpoint.
+
+
+# Resolve every `ToBeClassified` before release
+
+## Description
+
+`DataClassification = ToBeClassified` is the sentinel value the AL compiler accepts while a developer has not yet decided what a new field actually stores. It exists for the development phase only and must be resolved to a real classification (`CustomerContent`, `EndUserIdentifiableInformation`, `EndUserPseudonymousIdentifiers`, `AccountData`, `OrganizationIdentifiableInformation` or `SystemMetadata`) before the code ships. A released field left at `ToBeClassified` tells the platform "we have not classified this data" — which means GDPR data-subject requests, telemetry and audit reports cannot reason about it.
+
+## Best Practice
+
+Treat `ToBeClassified` as a TODO marker that fails release readiness. Sweep new table objects and table extensions for it before submitting a build for publication. If the right classification is genuinely unclear, decide between `CustomerContent` and `EndUserIdentifiableInformation` from the data's content, not from convenience.
+
+## Anti Pattern
+
+Leaving `ToBeClassified` in a shipped extension. Reviewers who treat the value as "I'll figure it out later" ship a field whose privacy posture is undefined for every customer that installs the app.
+
+
+# Every `Session.LogMessage` call must specify `DataClassification`
+
+## Description
+
+`Session.LogMessage` writes a record to the telemetry pipeline. The platform requires the call to carry an explicit `DataClassification` argument so that the entry can be routed and retained correctly downstream — telemetry consumers, GDPR exports, and Application Insights dashboards all rely on it. The compiler accepts overloads without the parameter (the two-argument and three-argument shapes that omit it), but for any telemetry that ships to customers, the `DataClassification`-bearing overload is the correct one.
+
+## Best Practice
+
+Use the overload that takes `Verbosity`, `DataClassification`, and `TelemetryScope`. For payload-free operational telemetry that does not embed customer data, `DataClassification::SystemMetadata` is the right value. Choose `TelemetryScope::ExtensionPublisher` for telemetry meant for the publishing partner only; `TelemetryScope::All` also forwards to the customer's tenant telemetry.
+
+See sample: `session-logmessage-requires-dataclassification.good.al`.
+
+## Anti Pattern
+
+Calling `Session.LogMessage('0003', 'Operation completed', Verbosity::Normal)` — the overload omits `DataClassification` and leaves the platform without the information needed to classify the entry. Detection signal: a `Session.LogMessage` call whose argument list ends at `Verbosity`.
+
+See sample: `session-logmessage-requires-dataclassification.bad.al`.
+
+
+# Table-level DataClassification cascades to every field unless overridden
+
+## Description
+
+`DataClassification` may be set at the table level. When it is, every field in the table inherits that classification and individual fields do not need their own `DataClassification` property. The cascade is the platform's intended way of classifying tables whose fields are homogeneous — for example, a system configuration log whose every column is `SystemMetadata`. A field only needs its own classification when its content genuinely differs from the table's default and the inherited value would be wrong.
+
+## Best Practice
+
+Set `DataClassification` once at the table level whenever every field in the table shares the same classification. Omit field-level `DataClassification` properties in that case. Override only on the specific fields whose data class differs from the table's — for example, a `SystemMetadata` audit table that nonetheless captures a `CustomerContent` value somewhere.
+
+See sample: `table-level-data-classification-cascades.good.al`.
+
+## Anti Pattern
+
+Flagging individual fields for "missing `DataClassification`" when the table declares one — the inheritance is the correct, intentional pattern. The mirror anti-pattern is repeating the same `DataClassification` on every field of a table that already declares it at the table level; the property is redundant and adds nothing the platform did not already know.
+
+
+# AL has no built-in HtmlEncode — encode HTML output by hand or avoid it
+
+## Description
+
+AL does not ship a built-in `HtmlEncode` (or equivalent) function. Code that builds an HTML fragment — an email body, a report header, a chart label rendered as HTML — by concatenating record-field values into a string is therefore unencoded by default, and any `<`, `>`, `&`, or `"` in the user content is interpreted as markup by the receiving renderer. The result is cross-site scripting in the recipient's mail client, browser, or report viewer. The absence of a built-in encoder is non-obvious to anyone used to platforms where `HtmlEncode` is a one-liner.
+
+## Best Practice
+
+Replace the four characters by hand before concatenating user content into HTML: `&` → `&amp;` first, then `<` → `&lt;`, `>` → `&gt;`, `"` → `&quot;`. Centralize the substitution in one helper so every HTML producer in the extension uses the same encoder. Better still, do not build raw HTML at all — use a structured format (JSON for an API payload, a report layout for a printed document) and let the renderer do the encoding. See sample: `al-has-no-built-in-htmlencode.good.al`.
+
+## Anti Pattern
+
+`HtmlContent := '<div>Welcome ' + UserName + '!</div>'` — any record-field value or user input concatenated directly into an HTML string. Reviewers should flag any string concatenation whose right-hand operand is a field, a parameter, or any non-literal value, and whose surrounding context contains HTML tags (`<`, `</`, `<br`, `<table`, `<a href=`). See sample: `al-has-no-built-in-htmlencode.bad.al`.
 
 
 # Use [CommitBehavior] to protect an atomic operation from third-party commits
@@ -1006,470 +971,913 @@ Publishing an `IntegrationEvent` from inside an atomic operation without `[Commi
 See sample: `commitbehavior-attribute-scopes-explicit-commits.bad.al`.
 
 
-# Compose secrets with SecretStrSubstNo
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Storing GetLastErrorText() in table fields is a privacy finding, not a security finding
 
 ## Description
 
-SecretStrSubstNo is the SecretText analogue of StrSubstNo. The template is a regular string literal; substitution arguments may be SecretText; the return value is SecretText. Intermediate results of the composition are never materialized as plaintext.
+It is tempting to flag any code that calls `GetLastErrorText()` and writes the result into a table field (or displays it to end users) as a security issue, on the assumption that the error text might leak credentials or system internals. In Business Central, that pattern is treated as a **privacy** concern instead: AL `Error` text frequently contains customer content (record keys, field values, document numbers) rather than infrastructure details, and the appropriate review owner is the privacy/DataClassification reviewer. A security reviewer should not raise a finding for `GetLastErrorText()` storage on the grounds that it might expose secrets; that risk is covered elsewhere by the rules that prevent secrets from appearing in error messages in the first place (see `secrettext-for-credentials.md`).
 
 ## Best Practice
 
-Format SecretText templates with SecretStrSubstNo. This is the correct primitive for building authorization headers, secret URIs, and any other formatted string that embeds a SecretText. Provide the static parts of the template as a regular string literal; only the substitutions carry the secret value.
-
-See sample: `compose-secrets-with-secretstrsubstno.good.al`.
+When auditing AL changes for security, ignore patterns where `GetLastErrorText()` is captured into a table or shown to users — leave those to the privacy review. Security findings on error text should be limited to the construction of the `Error()` call itself: secrets, paths, or technical internals being interpolated into the error before it is raised. See sample: `getlasterrortext-storage-is-privacy-not-security.bad.al` for the pattern that is *not* a security finding.
 
 ## Anti Pattern
 
-Using StrSubstNo (or plain string concatenation) on a plain-Text token to build an authorization header. The result is a Text containing the secret in plaintext, visible in the debugger, inspectable in snapshot debug sessions, and captured by any logging the caller does not control. SecretText should have been used end-to-end.
-
-See sample: `compose-secrets-with-secretstrsubstno.bad.al`.
+Filing a security finding such as "GetLastErrorText() stored in field — potential information disclosure" against AL code that captures an error for later inspection. The finding is in the wrong domain and crowds out the actual security signal. The mirror anti-pattern is silencing genuine `Error('... %1 ...', SecretValue)` constructions on the grounds that "error text is privacy" — those *are* security findings because they create the leak, regardless of where the text ends up afterwards.
 
 
-# Do not set ValidateTableRelation = false on fields that accept user input
+# Use indirect permissions when access must be code-mediated
 
 ## Description
 
-`TableRelation` on a field tells the platform that the value must exist as a primary key in the related table. `ValidateTableRelation = false` suppresses that check at validation time. On system-populated fields — values the code sets from a controlled source and never displays as editable — the suppression is acceptable because the integrity guarantee comes from the upstream writer. On a field the user types into (a page field, an import column, an API payload), disabling the validation means any value at all can be written: a non-existent customer number, a typo, a deliberate bad value. The table no longer enforces the relation, and downstream code that Gets the related row with an unguarded lookup breaks.
+In a `permissionset`, uppercase letters (`R`, `I`, `M`, `D`) grant **direct** permissions: the assignee can read, insert, modify, or delete the table data through any UI or API surface. Lowercase letters (`r`, `i`, `m`, `d`) grant **indirect** permissions: the operation is allowed only when it is invoked from AL code that itself holds the corresponding direct permission. Indirect permissions let a role consume privileged tables through controlled procedures (a report, a posting routine) without giving users a way to read or change those tables outside the intended code path.
 
 ## Best Practice
 
-Leave `ValidateTableRelation = true` (the default) on any field the user can set. When the default would produce unhelpful behaviour — a transient lookup that does not yet exist at validation time, a reference that uses a non-primary-key column — handle it with a targeted OnValidate trigger that performs the semantic check explicitly. Use `ValidateTableRelation = false` only when the field is genuinely system-controlled and the writer has already validated the reference.
-
-See sample: `do-not-disable-validatetablerelation-on-user-input.good.al`.
+Use indirect permissions (`ri`, `ii`, `mi`, `di`) when a role needs access to a sensitive table only through a specific codeunit or report — for example, a "Report Runner" role that reads `G/L Entry` only via published reports. Pair the indirect grant with the codeunit or report that mediates access; that object's own permissions (or InherentPermissions) supply the direct rights. Document why indirect permissions are required in the permission set or in the consuming object's comments. See sample: `indirect-permissions-for-elevated-access.good.al`.
 
 ## Anti Pattern
 
-A `Customer No.` field on an editable page with `TableRelation = Customer."No."` and `ValidateTableRelation = false` and no OnValidate fallback. The user can type any string; the platform accepts it; a later Get against Customer fails or returns the wrong row.
-
-See sample: `do-not-disable-validatetablerelation-on-user-input.bad.al`.
+Granting `RIMD` on a sensitive table when the role only needs to view it through a report — for example `tabledata "G/L Entry" = RIMD` on a "Report Runner" role. Users assigned that role can now query and modify ledger entries directly through any client that respects the permission, bypassing the report entirely. Reviewers should look for uppercase grants on system-of-record tables (G/L Entry, ledger entries, posted documents) where the consuming code path is clearly read-through-report or read-through-API. See sample: `indirect-permissions-for-elevated-access.bad.al`.
 
 
-# Do not expose sensitive data in event publishers
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Grant the minimum InherentPermissions a procedure needs
 
 ## Description
 
-Events in AL are extensibility contracts. Every subscriber — third-party, internal, or installed after the fact — receives the full set of event parameters. Parameters that carry secrets, pre-authorization state, or variables the publisher relies on for access control effectively become public, and var-parameters can be mutated by a subscriber to alter publisher behaviour.
+`[InherentPermissions(PermissionObjectType::..., ...)]` and `[InherentEntitlements(Entitlement::...)]` are method-level attributes that let a procedure perform an operation on the listed object even when the caller's permission set does not allow it. They effectively elevate the caller for the duration of the procedure. The grant therefore needs to be as narrow as the procedure's actual work — both in object scope (the specific table) and in operation (`'r'` versus `'RIMD'`). Overly broad inherent permissions silently expand the attack surface of every codeunit that calls the procedure.
 
 ## Best Practice
 
-Design event signatures to carry only the data a subscriber legitimately needs. Do not pass SecretText, credential material, or flags the publisher depends on for access control. If a subscriber needs to veto an action, model it as a separate OnBefore event whose Handled pattern is documented — not as a general-purpose var Boolean callers can flip.
-
-See sample: `do-not-expose-sensitive-data-in-event-publishers.good.al`.
+Match the inherent permission to the procedure's body: a procedure that only reads `Customer.Name` declares `[InherentPermissions(PermissionObjectType::TableData, Database::Customer, 'r')]`, not `'RIMD'`. Pick the inherent entitlement that matches the lowest tier the procedure should run under — do not require Premium for a procedure that performs an Essential-tier check. See sample: `inherent-permissions-minimal-grant.good.al`.
 
 ## Anti Pattern
 
-An OnBeforeElevateAccess publisher that exposes `var CanAccess: Boolean` — any subscriber installed on the tenant can flip it to true and escalate. Or a publisher that passes a SecretText parameter it obtained internally, handing it to every subscriber.
-
-See sample: `do-not-expose-sensitive-data-in-event-publishers.bad.al`.
+Declaring `[InherentPermissions(..., 'RIMD')]` on a read-only procedure (`GetCustomerName`), or `[InherentEntitlements(Entitlement::"Dynamics 365 Business Central Premium")]` on a procedure that performs a simple existence check. Reviewers should compare the attribute's permission letters against what the procedure body actually does and flag any grant broader than the operations performed. See sample: `inherent-permissions-minimal-grant.bad.al`.
 
 
-# Hardcoded GUIDs are only safe for well-known system identifiers
+# Do not pass credentials or secrets through IntegrationEvent parameters
 
 ## Description
 
-AL code sometimes carries hardcoded GUIDs. Some are platform-defined, stable across tenants and versions, and legitimately constant — the Base Application's ApplicationId (`{437dbf0e-84ff-417a-965d-ed2bb9650972}`) is the canonical example. Others identify a specific tenant, a specific Azure Active Directory application, or a specific environment; these look identical at the source-code level but are environment-bound and break the moment the extension is deployed anywhere else. Shipping an environment-specific GUID as a constant effectively locks the extension to one environment, and the failure mode in other tenants is usually an authentication error with no code-level signal pointing at the literal.
+`[IntegrationEvent]` publishes a hook that any extension can subscribe to. Every parameter of the event signature is visible to every subscriber — including `var` parameters, which subscribers can both read and modify. A publisher that includes an API key, password, bearer token, or other secret in the event signature hands that secret to every subscriber on the tenant, including subscribers in extensions the publisher has no relationship with. There is no permission or partner-only filter that limits who may subscribe.
 
 ## Best Practice
 
-Hardcoded GUIDs are acceptable for well-known system identifiers that are stable across environments — document the identifier with a comment that names what it refers to. For tenant IDs, AAD application IDs, API subscription IDs, and any value that varies by deployment, retrieve at runtime from IsolatedStorage, configuration tables, or the platform APIs that expose the current tenant context.
-
-See sample: `do-not-hardcode-environment-specific-guids.good.al`.
+Restrict event payloads to the non-sensitive context a subscriber legitimately needs: the business record being processed (a `Customer`), the operation being performed, an `IsHandled` flag that lets a subscriber skip the default behaviour, and a mutable payload object whose contents the publisher controls. Authentication is handled by the publisher before or after the event, never inside the parameters. See sample: `integrationevent-must-not-expose-secrets.good.al`.
 
 ## Anti Pattern
 
-`TenantId := '{12345678-1234-1234-1234-123456789012}';` or `AadApplicationId := '{87654321-...}';` inline in a codeunit. The extension authenticates in one environment and fails in every other; debugging starts from an AAD error message that does not mention the literal.
-
-See sample: `do-not-hardcode-environment-specific-guids.bad.al`.
+`[IntegrationEvent(false, false)] procedure OnBeforeSendRequest(var ApiKey: Text; var Password: Text; var RequestUrl: Text)` — any extension on the tenant can subscribe, read `ApiKey` and `Password`, and persist them elsewhere. Reviewers should flag any event parameter whose name or type suggests a secret (`ApiKey`, `Token`, `Password`, `Secret`, `Credential`, `SecretText` — even `SecretText` should not flow through an event surface). See sample: `integrationevent-must-not-expose-secrets.bad.al`.
 
 
-# Follow least privilege in permission sets
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Do not expose security guards as `var` parameters on IntegrationEvent
 
 ## Description
 
-Permission sets define the tabledata and object rights granted to every user or role assigned to them. A permission set that grants RIMD on tabledata * hands every caller full control over every table the extension exposes, which is never the shape of access any real role requires. Over-broad permission sets are a persistent source of privilege-escalation risk: once assigned, they are rarely audited.
+A `var` parameter on an `[IntegrationEvent]` is a mutable hook: any subscriber can overwrite the value and the publisher will see the new value when control returns. That is the right shape for "let an extension contribute to a payload"; it is the wrong shape for "let an extension confirm a security decision". A `var HasAccess: Boolean` or `var SkipValidation: Boolean` lets any subscriber on the tenant flip the result of the publisher's permission check to `true` (or set "skip" to `true`) before the publisher reads it. The publisher's check becomes advisory, which is the same as not having a check.
 
 ## Best Practice
 
-Enumerate the specific tabledata objects a role needs and grant only the letters (R, I, M, D) that role genuinely uses. A sales order-entry role typically needs RIM on Sales Header, RIMD on Sales Line, and R on Customer — not blanket RIMD. Permission sets SHOULD be granular and role-shaped; a single permission set that covers every role in an extension is a design smell.
-
-See sample: `follow-least-privilege-in-permission-sets.good.al`.
+Keep the security decision inside the publisher, where it is not bypassable. Fire an `OnAfter*` informational event after the check completes, with the result passed by value (not `var`) so subscribers can react — log, audit, surface a warning — but cannot rewrite the outcome. When subscribers legitimately need to add their own checks, expose an `OnAfterCheckPermissions(...)` that can only tighten access (e.g., a subscriber can `Error()`), never loosen it. See sample: `integrationevent-var-parameter-bypasses-security-guards.good.al`.
 
 ## Anti Pattern
 
-Granting `tabledata * = RIMD` (or any wildcard with I, M, or D) in a permission set. This bypasses any meaningful separation of duties the extension could enforce and gives unreviewed code paths the ability to insert, modify, and delete on any table.
-
-See sample: `follow-least-privilege-in-permission-sets.bad.al`.
+`OnBeforeCheckPermissions(var HasAccess: Boolean; var SkipValidation: Boolean; TableNo: Integer)`, followed in the caller by `if SkipValidation then exit;`. Any subscriber sets `SkipValidation := true` and the check is gone. Reviewers should flag any `IntegrationEvent` whose signature contains a `var Boolean` whose name reads like a security decision (`HasAccess`, `IsAllowed`, `SkipValidation`, `BypassCheck`, `IsAuthorized`). See sample: `integrationevent-var-parameter-bypasses-security-guards.bad.al`.
 
 
-# Never hardcode secrets in AL
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Procedures that read or write IsolatedStorage must not be public
 
 ## Description
 
-A secret embedded in AL source — API key, password, connection string, token — lives forever: in the app package, in source control history, in every debugger session that sees the assignment, and in any log that captures the containing variable. Rotation is effectively impossible without a new release, and the blast radius covers every tenant the extension is installed in.
+`IsolatedStorage` partitions its data by extension: values written by one extension are unreadable to another. That guarantee assumes the owning extension does not voluntarily expose its storage through a public API. A `public` procedure on a codeunit that calls `IsolatedStorage.Get`, `IsolatedStorage.Set`, `IsolatedStorage.SetEncrypted`, `IsolatedStorage.Contains`, or `IsolatedStorage.Delete` defeats the isolation: any other extension on the same tenant can call that procedure and obtain (or overwrite) the secret. The platform's per-extension boundary becomes a per-procedure boundary, and there is no per-procedure boundary.
 
 ## Best Practice
 
-Retrieve secrets at runtime from a protected store: Azure Key Vault for production workloads (see prefer-azure-key-vault-for-production-secrets) or IsolatedStorage for tenant-local encrypted values (see use-isolated-storage-for-module-and-company-secrets). Carry the retrieved value in a SecretText variable end-to-end (see use-secrettext-for-credentials).
-
-See sample: `never-hardcode-secrets-in-al.good.al`.
+Mark every procedure that touches `IsolatedStorage` as `local` (visible only inside its containing object) or `internal` (visible only inside the owning extension). Provide consumers with a narrow, intent-specific API — for example, "send notification to configured webhook" rather than "give me the webhook secret." See sample: `isolatedstorage-access-must-be-local-or-internal.good.al`.
 
 ## Anti Pattern
 
-Assigning a secret literal to a Text, Code, or Label variable (including labels marked as constants). The secret is now part of the compiled app and indistinguishable from non-sensitive content to callers and tools.
-
-See sample: `never-hardcode-secrets-in-al.bad.al`.
+A public `GetApiKey()` returning the stored value, or a public `SetApiKey(NewKey: Text)` that calls `IsolatedStorage.SetEncrypted`. Both turn the extension into a confused deputy that hands out (or accepts overwrites of) its own secrets on behalf of any caller on the tenant. Reviewers should flag any procedure whose body references `IsolatedStorage` and whose declaration omits `local` or `internal`. See sample: `isolatedstorage-access-must-be-local-or-internal.bad.al`.
 
 
-# Prefer Azure Key Vault for production secrets
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Pick the right IsolatedStorage DataScope for the secret's lifetime
 
 ## Description
 
-Azure Key Vault is an external secret store that supports central management, rotation, and access auditing. The Business Central system application exposes integration APIs that retrieve Key Vault secrets at runtime. IsolatedStorage, by contrast, is a per-tenant local encrypted store with no central rotation or audit story.
+`IsolatedStorage` read and write methods take a `DataScope` parameter that decides which slice of storage the value belongs to. The choice is not a stylistic one — it changes which callers, in which company and under which user, can read the value back. Two scopes cover the common cases for app-level secrets: `DataScope::Module` stores the value once for the whole extension, isolated to that extension on the tenant — the right scope for app-specific secrets such as a global API key or service account. `DataScope::Company` stores the value per company, so each company on the tenant has its own slot — the right scope for company-specific secrets such as a per-company webhook URL or a per-company integration token. A per-user scope also exists for values that belong to an individual user.
 
 ## Best Practice
 
-For production workloads that require secret rotation, access auditing, and separation between secret custodians and app developers, Azure Key Vault SHOULD be the store of record. Retrieve secrets into a SecretText variable on demand, cache only as long as the call requires, and never persist the retrieved plaintext anywhere the extension does not control. IsolatedStorage MAY be used when a per-tenant local encrypted store is all that is required.
+Choose `Module` when the secret is the same for every company and every user under the extension (a single tenant-wide API key). Choose `Company` when each company has its own integration credentials. Choose the user scope only when the secret is genuinely per-user. Use the same `DataScope` value on `Set`/`SetEncrypted`, `Get`, `Contains`, and `Delete` for the same key — mixing scopes for the same logical secret produces silent "not found" results. See sample: `isolatedstorage-datascope-module-vs-company.good.al`.
 
 ## Anti Pattern
 
-Treating IsolatedStorage as the long-term home for secrets in a multi-tenant production extension where secret rotation, central revocation, or access auditing are required.
+Defaulting every call to `DataScope::Module` regardless of intent — storing a per-company webhook URL under `Module` means every company on the tenant shares the same URL. Or the inverse: storing a tenant-wide API key under `Company` means each company-switch effectively loses the key. Reviewers should look for cross-method inconsistency (`Set` under `Module`, `Get` under `Company`) and for scope choices that contradict the value's documented lifetime. See sample: `isolatedstorage-datascope-module-vs-company.bad.al`.
 
 
-# Use indirect permissions for elevated access
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Prefer IsolatedStorage.SetEncrypted over Set for sensitive values
 
 ## Description
 
-Indirect permissions (ri, ii, mi, di) let a procedure perform an operation against tabledata the caller does not have direct rights to, provided the caller is authorized to invoke the procedure. They are the supported mechanism for elevation: instead of widening every caller's direct rights to M or D, the sensitive operation lives in a codeunit that holds the indirect right and validates its callers.
+`IsolatedStorage` exposes two write entry points: `Set` stores the value as-is, and `SetEncrypted` stores it encrypted at rest. Both are scoped per extension, but only `SetEncrypted` adds the additional protection that the value is not readable from the underlying storage by anything that bypasses the AL `IsolatedStorage` API. The choice between them is by intent: configuration that is not sensitive (a user preference, a default flag) can use `Set`; anything that would harm the tenant if leaked — API keys, tokens, connection strings, OAuth client secrets — uses `SetEncrypted`.
 
 ## Best Practice
 
-Where a module exposes a controlled write or delete against a sensitive table, grant the codeunit (or the helper permission set it assumes) the indirect permission (mi, di) it requires, keep direct permissions minimal, and document why the elevation is justified. The helper MUST validate its inputs and the caller's identity before performing the elevated work.
-
-See sample: `use-indirect-permissions-for-elevated-access.good.al`.
+Use `IsolatedStorage.SetEncrypted` for every value that meets the definition of a secret. Pair it with the matching retrieval pattern: `IsolatedStorage.Contains` to test for presence and `IsolatedStorage.Get` (preferably with a `SecretText` destination) to read. Constrain the input length before storing — long values can exceed the encrypted-storage size limit and the write will fail at runtime. See sample: `isolatedstorage-setencrypted-for-sensitive-values.good.al`.
 
 ## Anti Pattern
 
-Granting direct M or D on a sensitive tabledata to every role that might invoke a helper, because authoring an indirect-permission codeunit was inconvenient. Every caller now has the elevated right for every code path, not just the one the helper implements.
-
-See sample: `use-indirect-permissions-for-elevated-access.bad.al`.
+`IsolatedStorage.Set('ApiKey', ApiKeyValue, DataScope::Module)` — the key is now sitting in storage unencrypted, and any future incident that exposes the underlying storage exposes the key. Reviewers should flag any `IsolatedStorage.Set` whose key name or surrounding context suggests a secret (`ApiKey`, `Token`, `Password`, `Secret`, `ClientSecret`). See sample: `isolatedstorage-setencrypted-for-sensitive-values.bad.al`.
 
 
-# Use InherentPermissions to grant minimal access
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Mark procedures that call SecretText.Unwrap() as [NonDebuggable]
 
 ## Description
 
-The InherentPermissions attribute attaches a minimum access grant to a procedure. Callers can invoke the procedure without holding the underlying tabledata right, because the attribute supplies exactly the right required by the procedure body and nothing more. InherentPermissions currently targets only objects owned by the same extension as the annotated procedure; it cannot be used to grant access to tables in other extensions or in the base application.
+`SecretText` transit — assignment, parameter passing, and return values — is auto-protected: the debugger sees a redacted placeholder, not the value. The protection ends the moment code calls `.Unwrap()`, which converts the `SecretText` back to plain `Text`. From that point on, the local variable holding the result is visible in the debugger like any other `Text`. The `[NonDebuggable]` attribute marks a procedure so that none of its locals or parameters are visible to the debugger during execution, which is exactly what is needed for any procedure that performs an `Unwrap()` or that otherwise materializes a secret as `Text` (for example, while parsing a JSON response to extract an access token).
 
 ## Best Practice
 
-Annotate read-only helper procedures with InherentPermissions specifying only the tables and access letters the body uses (typically 'r'). Callers do not need direct read rights on the underlying extension-owned table, so the calling role can be narrower. This is the narrowest of the elevation options and is appropriate for read-only lookup helpers.
-
-See sample: `use-inherent-permissions-to-grant-minimal-access.good.al`.
+Apply `[NonDebuggable]` to any procedure whose body calls `.Unwrap()` on a `SecretText`, and to any procedure that constructs a `SecretText` from a `Text` source (such as a procedure that reads a JSON response body and converts the resulting `Text` into a `SecretText` for the caller). Keep the unwrap window as small as possible — ideally a single one-line helper that hands the unwrapped value straight to the consuming API. See sample: `nondebuggable-required-when-unwrapping-secrettext.good.al`.
 
 ## Anti Pattern
 
-A helper that reads a single lookup value but forces every calling role to hold tabledata read rights, because the helper does not declare its own inherent permissions. The broad read right then applies to every other code path that role can reach, not just the helper.
-
-See sample: `use-inherent-permissions-to-grant-minimal-access.bad.al`.
+Calling `ApiKey.Unwrap()` inside a procedure that is not marked `[NonDebuggable]`. The unwrapped value is now an ordinary `Text` local and the debugger will display it, defeating the purpose of using `SecretText` in the first place. Reviewers should flag any `Unwrap()` call in a procedure that lacks the attribute, and any procedure that parses a credential out of a response (`access_token`, `id_token`, `client_secret`) without the attribute. See sample: `nondebuggable-required-when-unwrapping-secrettext.bad.al`.
 
 
-# Use IsolatedStorage for module and company secrets
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Avoid wildcard grants in permission sets
 
 ## Description
 
-IsolatedStorage is a per-extension, per-tenant key-value store. DataScope::Module isolates values to the extension across the tenant; DataScope::Company scopes them to a single company within the tenant. The SetEncrypted method stores the value encrypted at rest; Set stores it in plaintext. SetEncrypted accepts inputs up to 215 characters (special characters may consume more space).
+A `permissionset` object can grant access object-by-object or with the `*` wildcard. Wildcard grants — `tabledata * = RIMD` (Read/Insert/Modify/Delete on every table) and `table * = X` (Execute on every table object) — collapse the principle of least privilege into a single line and are almost never what the author intended. The grant binds for the lifetime of the permission set wherever it is assigned, including indirectly via role assignment. Permission sets should be granular and role-specific, enumerating only the objects the role actually needs.
 
 ## Best Practice
 
-Use IsolatedStorage.SetEncrypted to write secrets, IsolatedStorage.Contains to probe, and IsolatedStorage.Get into a SecretText destination to read. Choose DataScope::Company for per-company credentials (for example, a tenant-per-company service account) and DataScope::Module for extension-wide configuration.
-
-See sample: `use-isolated-storage-for-module-and-company-secrets.good.al`.
+Enumerate each `tabledata` and each `table` entry explicitly. Grant only the letters required: `R` for read-only consumers, `RIM` for editors that do not delete, `RIMD` only for owners of the data. When a role needs Execute on objects, list those objects rather than using `table *`. See sample: `permission-set-avoid-wildcard-grants.good.al`.
 
 ## Anti Pattern
 
-Storing secrets in a Setup table column as plain Text, or using IsolatedStorage.Set (unencrypted) for values that authenticate the extension to an external service. Both shapes leave the secret readable by anyone with read rights on the underlying storage.
-
-See sample: `use-isolated-storage-for-module-and-company-secrets.bad.al`.
+`Permissions = tabledata * = RIMD;` and `Permissions = table * = X, tabledata * = R;` — both grant access to objects the role's author never inspected, and the grant silently broadens every time a new table ships in the platform or in another extension. Reviewers should flag any `*` on the left-hand side of a `tabledata` or `table` entry. See sample: `permission-set-avoid-wildcard-grants.bad.al`.
 
 
-# Use NonDebuggable when parsing secrets
-
-> Contributions welcome — open a PR to refine or extend this article.
+# Procedures that RecordRef.Open a caller-provided table must not be public
 
 ## Description
 
-SecretText transit (assignment between SecretText variables, parameters, and return values) is protected automatically. Extracting a secret from a Text source — for example, reading an access token out of a parsed JSON response — is a legitimate Text-to-SecretText conversion during which the plaintext exists. The [NonDebuggable] attribute prevents debuggers (regular and snapshot) from inspecting the procedure's locals, parameters, and return at that moment.
+When a codeunit holds permission to system tables — directly, via a permission set granted at install, or via `[InherentPermissions]` — and exposes a public procedure that accepts a table number (or a `RecordId`, from which the table number is derived) and calls `RecordRef.Open` on it, the procedure becomes a confused deputy. Any other extension on the same tenant can invoke the procedure with the table number of a system table the calling extension does not own permissions for and obtain access to its rows through the wrapper. This is especially acute in SaaS: an on-premises-style extension that holds broad permissions can be exploited by a co-tenant extension that calls its public surface.
 
 ## Best Practice
 
-Apply [NonDebuggable] to any procedure that reads a response body, parses it, and assigns the extracted secret to a SecretText out-parameter or return. Keep the procedure narrow: it SHOULD do the minimum work required to obtain the SecretText, and nothing else.
-
-See sample: `use-nondebuggable-when-parsing-secrets.good.al`.
+Mark such procedures `local` (callable only inside the containing object), `internal` (callable only inside the owning extension), or `[Scope('OnPrem')]` (not callable from SaaS extensions). If the procedure must be public, validate the table number against an allow-list before `RecordRef.Open` — `if not IsAllowedTable(RecId.TableNo) then Error(...)` — so the caller cannot specify an arbitrary table. See sample: `recordref-open-with-caller-table-must-not-be-public.good.al`.
 
 ## Anti Pattern
 
-Parsing a token response in a normal (debuggable) procedure. The plaintext token is visible in debug sessions and snapshots taken during the parse.
-
-See sample: `use-nondebuggable-when-parsing-secrets.bad.al`.
+`procedure ArchiveRecord(RecId: RecordId)` (public by default) whose body calls `RecRef.Open(RecId.TableNo)` and then reads, modifies, or deletes the record. Reviewers should flag any procedure that is public (no `local`/`internal`/`[Scope('OnPrem')]`), takes a `RecordId`, `Integer` table number, or `Variant` as a parameter, and calls `RecordRef.Open` with that parameter — unless an allow-list check on the table number precedes the open. See sample: `recordref-open-with-caller-table-must-not-be-public.bad.al`.
 
 
-# Use SecretText for credentials
+# Use SecretStrSubstNo to compose strings that contain secrets
 
 ## Description
 
-SecretText is a compile-time-checked AL type for credentials, API keys, tokens, and similar sensitive values. The compiler rejects literal assignments to SecretText and blocks implicit conversion back to Text or Code, which prevents many accidental disclosures via logs, errors, and the debugger (regular and snapshot). A SecretText value remains opaque throughout its lifetime.
+`SecretStrSubstNo` is the secret-preserving counterpart of `StrSubstNo`. It accepts a format string and arguments (any of which may be `SecretText`) and returns a `SecretText` — the substitution happens without ever materializing the result as plain `Text`. It is the right tool whenever a secret needs to be embedded in a larger string: an `Authorization: Bearer <token>` header value, a URI that includes an API key as a query parameter, or any other interpolation that combines a `SecretText` with surrounding context.
 
 ## Best Practice
 
-Type every credential-carrying variable, procedure parameter, and return as SecretText. Compose values with SecretStrSubstNo (see compose-secrets-with-secretstrsubstno). For HttpClient integration, see use-secrettext-with-httpclient. When a secret must be extracted from a Text source, contain that conversion in a NonDebuggable procedure (see use-nondebuggable-when-parsing-secrets).
-
-See sample: `use-secrettext-for-credentials.good.al`.
+Compose every secret-bearing string through `SecretStrSubstNo` and keep the result as `SecretText` end-to-end. Pass the result to the `SecretText` overload of the consumer — `HttpClient.SetSecretRequestUri`, `HttpHeaders.Add`, or `HttpContent.WriteFrom`. See sample: `secretstrsubstno-for-composing-secrets.good.al`.
 
 ## Anti Pattern
 
-Passing credentials around as Text or Code parameters. Every such variable is visible in the debugger and may be captured by error handlers, logs, and telemetry that treat Text as non-sensitive.
-
-See sample: `use-secrettext-for-credentials.bad.al`.
+Calling `StrSubstNo('Bearer %1', Token.Unwrap())` to build the header value, or concatenating `'Bearer ' + Token.Unwrap()`. Both produce a plain `Text` containing the secret, which is then visible in the debugger and in any subsequent log or trace. Reviewers should flag any `Unwrap()` whose result is fed into `StrSubstNo` or used in `+` concatenation — `SecretStrSubstNo` removes the need for either. See sample: `secretstrsubstno-for-composing-secrets.bad.al`.
 
 
-# Use SecretText with HttpClient
+# Use SecretText for credentials, API keys, and tokens
 
 ## Description
 
-HttpRequestMessage, HttpHeaders, and HttpContent expose SecretText overloads so credentials never have to be converted back to Text to be sent. Key APIs: HttpRequestMessage.SetSecretRequestUri (for URIs containing secrets), HttpHeaders.Add(name, SecretText) for authorization headers, HttpHeaders.ContainsSecret to probe secret-valued headers, HttpContent.WriteFrom(SecretText) for request bodies, and HttpContent.ReadAs(SecretText) to pull response bodies into a secret destination.
+`SecretText` is the AL data type for values that should never appear in a debugger session, in a log, or in a variable watch. The compiler enforces two guarantees: a string literal cannot be assigned directly to a `SecretText` variable, and a `SecretText` cannot be assigned back to a `Text` or `Code` without an explicit `Unwrap` call. Together these prevent the two common accidents — embedding a secret in source code, and quietly converting a secret to plain text where the debugger can read it. Use `SecretText` for parameters, return values, and local variables that carry API keys, tokens, passwords, connection strings, or any other value an attacker with debugger access should not see.
 
 ## Best Practice
 
-Use HttpRequestMessage.SetSecretRequestUri when any URI component is sensitive (for example, a per-call API key in the path or query), and send the request with HttpClient.Send. Add Authorization headers as SecretText. Check for the presence of a secret header with ContainsSecret, not Contains.
-
-See sample: `use-secrettext-with-httpclient.good.al`.
+Declare credential-carrying parameters and variables as `SecretText` from the call site that retrieves the secret all the way to the call site that consumes it (typically an `HttpClient` header or URI). Never round-trip through `Text` — every conversion is a potential exposure point. Retrieve secrets from `IsolatedStorage` with the `SecretText` overload of `Get` rather than the `Text` overload. See sample: `secrettext-for-credentials.good.al`.
 
 ## Anti Pattern
 
-Materializing a URI or header value as Text to 'just get it to compile' — for example, StrSubstNo into a Text and then HttpClient.Get(FullUrl, Response). The resulting Text is visible in debuggers, and the URL is typically captured by platform-level logging the extension does not control.
-
-See sample: `use-secrettext-with-httpclient.bad.al`.
+Holding a credential in a `Text` variable (`BearerToken: Text`), concatenating it into a header, then passing it to `HttpClient`. The token is visible in the debugger and in any error that prints the variable, and the compiler offers no help because the type was wrong from the start. Reviewers should flag any local or parameter named like a secret (`ApiKey`, `Token`, `Password`, `ClientSecret`) whose type is `Text` or `Code`. See sample: `secrettext-for-credentials.bad.al`.
 
 
-# Suffix every Label and TextConst with its approved usage tag
+# Use the SecretText-aware HttpClient surface for secrets in requests
 
 ## Description
 
-CodeCop rule AA0074 requires every Label and TextConst to carry a suffix indicating how the value is consumed: `Msg` for Message calls, `Err` for Error calls, `Qst` for Confirm or StrMenu prompts, `Tok` for locked tokens (URLs, JSON keys, short literals with `Locked = true`), `Lbl` for captions and tooltips, and `Txt` for telemetry strings. The suffix is not decoration — it is how the compiler, linter, and reviewer detect misuse (a `Tok` value passed to `Error`, a `Msg` used as an error label). The cost of adopting the convention is one short suffix per declaration; the cost of ignoring it is that every reviewer has to inspect every call site to judge appropriateness.
+`HttpClient` and its companion types expose a parallel surface that accepts `SecretText` instead of `Text`, so that secret URIs, secret headers, and secret request bodies never round-trip through plain text. The key entry points are: `HttpClient.SetSecretRequestUri()` for URIs that contain secrets (the subsequent `Get`/`Post` is then called with an empty string); `HttpHeaders.Add()` overload that accepts a `SecretText` value for authorization headers; `HttpHeaders.ContainsSecret()` to test whether a secret header is present (the plain `Contains()` returns false for secret headers); `HttpContent.WriteFrom()` and `HttpContent.ReadAs()` overloads that accept and produce `SecretText` for request and response bodies that carry credentials.
 
 ## Best Practice
 
-Name every Label and TextConst with one of `Msg`, `Err`, `Qst`, `Tok`, `Lbl`, or `Txt` at the end. Pick the suffix that matches the consuming call, not the look of the string. When multiple suffixes are grammatically valid (`Tok` vs `Lbl` for a short caption on a locked token) the choice is a judgment call; the violation is missing a suffix or using one inconsistent with the call site.
-
-See sample: `apply-approved-label-suffixes.good.al`.
+When the URI contains a secret query parameter, compose it as `SecretText` (see `secretstrsubstno-for-composing-secrets.md`), pass it to `SetSecretRequestUri`, and call `Get('', Response)` with an empty string as the URI argument. When the credential is an authorization header, build the header value as `SecretText` and pass it to `Headers.Add`. Use `ContainsSecret` rather than `Contains` to check for the presence of a secret header. See sample: `secrettext-with-httpclient.good.al`.
 
 ## Anti Pattern
 
-`CannotDeleteLine: Label 'Cannot delete this line.';` — no suffix, used with Error. `Text000: Label 'Update complete';` — generic name with no suffix at all. `WrongSuffixTok: Label 'Customer %1 not found.'` used with Error — a Tok suffix on an error label.
-
-See sample: `apply-approved-label-suffixes.bad.al`.
+Calling `ApiKey.Unwrap()` to build a URI or header string and passing the resulting `Text` to `HttpClient.Get` or `Headers.Add`. The unwrapped secret is now visible in the debugger, in any HTTP trace that captures the request URI, and in any error that includes the URI. Reviewers should flag any `Unwrap()` call whose result flows into an `HttpClient` argument; the `SecretText` overload exists precisely so the unwrap is not needed. See sample: `secrettext-with-httpclient.bad.al`.
 
 
-# API pages follow strict naming and property rules that differ from regular pages
+# Validate URLs that come from table fields before calling them
 
 ## Description
 
-Pages declared `PageType = API` are exposed through the OData API surface. The platform enforces a set of conventions that regular pages do not share: `APIPublisher`, `APIGroup`, `EntityName`, and `EntitySetName` must be camelCase alphanumeric only — no spaces, hyphens, or underscores. `APIVersion` must match the pattern `vX.Y` (for example `v2.0`) or the literal `beta`. `EntityName` is the singular form (`customer`); `EntitySetName` is the plural (`customers`). `DelayedInsert = true` is effectively required for the OData insert workflow to behave correctly on composite keys. These rules are platform-enforced and tooling-enforced; violations produce runtime errors or consumer-visible inconsistencies rather than soft warnings.
+A URL stored in a table field is user-configurable: anyone with write access to the row can change it. If that URL is then used as the target of an `HttpClient.Get`/`Post`, the extension becomes a server-side request forgery (SSRF) primitive — an attacker can redirect the call to an internal endpoint, to a metadata service, or to a malicious host that mirrors the legitimate API. The `Uri` codeunit from System Modules provides two validators built for this situation: `AreURIsHaveSameHost()` checks that two URLs share the same host (use when the hostname should not change — for example, the extension always talks to `api.contoso.com`). `IsValidURIPattern()` checks that a URL matches a wildcard pattern (use when the host varies but follows a predictable shape — for example `https://{store}.myshopify.com/...`).
 
 ## Best Practice
 
-For every API page: camelCase alphanumeric API properties; `APIVersion` as `vX.Y` or `beta`; singular `EntityName` and plural `EntitySetName`; `DelayedInsert = true`. Keep these properties together near the top of the page definition so reviewers can check the set at a glance.
-
-See sample: `follow-api-page-naming-rules.good.al`.
+Before any `HttpClient` call whose URL came from a table field, call `Uri.AreURIsHaveSameHost(StoredUrl, ExpectedBaseUrl)` against a hard-coded expected base, or `Uri.IsValidURIPattern(StoredUrl, 'https://*.myshopify.com/*')` against a fixed pattern. Fail the call with an `Error` when the validator returns false. For webhook scenarios where the host is registered out-of-band, compare against the registered host stored alongside the URL. See sample: `validate-user-configurable-urls.good.al`.
 
 ## Anti Pattern
 
-`APIPublisher = 'Contoso-App'` (hyphen rejected), `EntityName = 'customers'` and `EntitySetName = 'customer'` (swapped), `APIVersion = 'v2'` (missing minor version), `DelayedInsert` omitted. Each violation surfaces only when a consumer exercises the endpoint.
-
-See sample: `follow-api-page-naming-rules.bad.al`.
+`HttpClient.Get(Setup."Service URL", Response)` or `HttpClient.Post(WebhookSetup."Callback URL", Content, Response)` with no validation step in between. The extension will dutifully send the request — and any sensitive payload — to whatever host the attacker put in the field. Reviewers should flag any `HttpClient` call whose first argument is a record field, an `OnValidate`-mutable field, or a value sourced from a table read, unless a `Uri.AreURIsHaveSameHost` or `Uri.IsValidURIPattern` check precedes it. See sample: `validate-user-configurable-urls.bad.al`.
 
 
-# Label placeholders need a Comment; locked strings need Locked = true
+# Do not set ValidateTableRelation = false on user-editable fields
 
 ## Description
 
-AL Labels accept optional properties — `Comment`, `Locked`, `MaxLength` — that travel with the string to localization. The Comment is the translator's only signal for what `%1` and `%2` mean; without it, `'Document %1 has errors in %2.'` translates unpredictably because the translator has to guess whether %1 is a document number, document type, or document name. `Locked = true` marks a string as non-translatable — URLs, JSON keys, short command tokens — and keeps the localization pipeline from translating literals that must stay verbatim. `MaxLength` limits how much of the label survives truncation. The Comment is required whenever placeholders are not self-evident; Locked is required on any non-text value.
+`TableRelation` on a field declares that the field's value must exist in another table; the platform validates the value on entry and on `Validate`. Setting `ValidateTableRelation = false` keeps the relation as metadata (used by lookups, by Edit-in-Excel, by APIs) but turns off the runtime check. On a system-controlled, non-editable field that is populated only by the platform or by a posting routine, that is acceptable. On a user-editable field, it is dangerous: users can type any value, and downstream code that assumes the relation holds will read a `Customer` record that does not exist, post to an account that was deleted, or join against missing rows.
 
 ## Best Practice
 
-For placeholders, write `Comment = '%1 = Customer No., %2 = Document Type'` alongside the Label. For URLs, HTTP methods, JSON keys, and similar literals, set `Locked = true` and use the `Tok` suffix (see `apply-approved-label-suffixes`). For captions with a tight visual budget, set `MaxLength` to the enforceable length. When the placeholder meaning is obvious (`'Customer %1 not found.'`) the Comment is optional.
-
-See sample: `include-comment-on-labels-with-placeholders.good.al`.
+Leave `ValidateTableRelation` at its default (true) on any field a user can edit. If there is a legitimate reason to turn it off — typically because the relation is not on the primary key, or because the relation is computed — replace it with an `OnValidate` trigger that performs the equivalent check (`if FieldValue <> '' then VerifyExternalReferenceExists(FieldValue)`). Combine `ValidateTableRelation = false` with `Editable = false` for system-controlled fields, so the metadata is correct and the field is unreachable from the UI. See sample: `validatetablerelation-false-on-user-input.good.al`.
 
 ## Anti Pattern
 
-`CustomerLocationErr: Label 'Customer %1 not found in %2.';` with no Comment — translators will not know which identifier maps to which placeholder. `HttpsUrl: Label 'https://example.com';` with no Locked — the URL enters the localization pipeline and may be translated into a broken address.
-
-See sample: `include-comment-on-labels-with-placeholders.bad.al`.
+`ValidateTableRelation = false` on a user-facing input field (a `Customer No.` typed by a sales user) with no alternative validation. Reviewers should flag the combination of `ValidateTableRelation = false` and any of: `Editable = true` (the default), an `OnValidate` trigger that does not perform the relation check, or a page that surfaces the field as input. See sample: `validatetablerelation-false-on-user-input.bad.al`.
 
 
-# OptionCaption must list exactly as many captions as OptionMembers
+# Use `AboutTitle` and `AboutText` to surface teaching tips on top-level pages
 
 ## Description
 
-Option fields declare their values in `OptionMembers` and their localized display text in `OptionCaption`. The two lists are positionally paired — the Nth caption maps to the Nth member — and a mismatch either in count or in intent produces a field that renders blank for some values or shows the wrong caption for others. CodeCop rules AA0221, AA0223, and AA0224 flag the variants of this mistake: missing OptionCaption entirely on non-table-sourced option fields, OptionCaption with a different element count than OptionMembers, and OptionCaption content that does not correspond to the member names.
+The `AboutTitle` and `AboutText` properties on a page render a teaching tip — an onboarding callout that appears the first time a user opens the page. They are supported on pages, individual page controls, FactBoxes, and report request pages. They are NOT supported on Role Centers or modal dialogs. The conventions: `AboutTitle` answers "what is this page about?" and uses the plural for list pages (`'About sales invoices'`) and the `[entity] details` form for card and document pages (`'About sales invoice details'`); `AboutText` answers "what can I do with this page?" in two or three short sentences. Both are translation-aware and surface to the end user verbatim.
+
+The reviewer signal is "this is a new top-level card or list page in an app whose sibling pages already define teaching tips" — when the surrounding app sets the precedent, a new page without `AboutTitle`/`AboutText` is an inconsistency worth flagging.
 
 ## Best Practice
 
-Whenever OptionMembers is declared, declare OptionCaption with the same number of entries in the same order. For table-sourced option fields, the base table's caption applies and a per-page override is usually unnecessary — the rule applies to option fields defined in pages, reports, and non-table sources.
+Set `AboutTitle` and `AboutText` on every new top-level card, list, and document page in an app that already uses them. Keep `AboutText` to two or three short sentences. Describe what the page does, not the navigation steps to use it — teaching tips explain WHAT, not HOW.
 
-See sample: `match-optioncaption-count-to-optionmembers.good.al`.
+See sample: `abouttitle-abouttext-teaching-tips.good.al`.
 
 ## Anti Pattern
 
-`OptionMembers = Low,Medium,High,Critical;` paired with `OptionCaption = 'Low,Medium,High';` — three captions for four members. `Critical` rows render with the empty caption, or fall back to the member name, depending on where the option is displayed.
+A new top-level page in an app whose siblings have `AboutTitle`/`AboutText`, but with no teaching tips defined. Equally wrong is filling `AboutText` with step-by-step instructions ("Click New, then enter…") — the property is for orientation, not procedural help.
 
-See sample: `match-optioncaption-count-to-optionmembers.bad.al`.
+See sample: `abouttitle-abouttext-teaching-tips.bad.al`.
 
 
-# Name AL files as `<ObjectName>.<ObjectType>.al`
+# API pages use camelCase, alphanumeric-only values for API properties
 
 ## Description
 
-Business Central AL projects follow a consistent file-naming convention: the file name is the object's name, followed by a dot, followed by the object type (`Page`, `Codeunit`, `Table`, `Report`, `Enum`, etc.), followed by `.al`. `CustomerCard.Page.al`, `PostSalesInvoice.Codeunit.al`, `SalesLine.Table.al`. The convention produces an alphabetically-ordered folder that groups all of an entity's objects (`SalesLine.Table.al`, `SalesLine.TableExt.al`, `SalesLineCard.Page.al`) next to each other, and makes navigation by file name in large repos predictable.
+API pages — pages declared with `PageType = API` — surface as OData/JSON endpoints. The strings that appear in the URL (`APIPublisher`, `APIGroup`, `EntityName`, `EntitySetName`) and the JSON payload field names follow different naming rules from the rest of AL. They must be camelCase and use only alphanumeric characters: no hyphens, no underscores, no spaces, no punctuation. `'Contoso-App'`, `'contoso_app'`, and `'contoso.app'` are all rejected. The same rule applies to page field names exposed via `Name = '…'` on API page controls — those names appear verbatim in the JSON keys.
 
 ## Best Practice
 
-Match the file name to the object declaration: PascalCase name, type segment, `.al`. Use `TableExt`, `PageExt`, `EnumExt` for the corresponding extension types. When multiple objects share a file (generally discouraged), name the file after the primary object.
+Pick camelCase identifiers up front: `APIPublisher = 'contoso'`, `APIGroup = 'app1'`, `EntityName = 'customer'`, field `Name = 'displayName'`. Keep them short — they end up in URL paths and JSON keys that every consumer types.
+
+See sample: `api-page-camelcase-properties.good.al`.
 
 ## Anti Pattern
 
-`customer_page.al`, `PostSalesInvoiceLogic.al`, `tests_noSeries.al` — all three violate the convention. The first uses snake_case, the second adds a descriptive suffix after the object name, the third prefixes the type instead of suffixing it. Tooling that expects the convention (AL-Go scaffolding, navigation helpers, diff conventions) then misbehaves on these files.
+`APIPublisher = 'Contoso-App'` (hyphen rejected, capitalization wrong for camelCase), `EntityName = 'sales_order'` (underscore rejected), or fields exposed with `Name = 'Display Name'` (space rejected). The compiler usually catches these, but the failure mode is opaque and the rename cost on a deployed API is high.
+
+See sample: `api-page-camelcase-properties.bad.al`.
 
 
-# Pass Error parameters directly to the Label; do not pre-build with StrSubstNo or concatenation
+# Set `DelayedInsert = true` on API pages
 
 ## Description
 
-`Error` accepts a Label and its substitution parameters directly (`Error(CustomerNotFoundErr, CustomerNo, DocumentNo)`). Pre-building the message via `StrSubstNo` and passing the resulting Text, or concatenating parts with `+` and passing the result, compiles but produces two distinct regressions. The localization pipeline can only translate the Label; a pre-built Text is passed through untouched, so non-English users see the English template. Platform telemetry inspects the Label's placeholder arguments for DataClassification; a pre-built Text is opaque, so PII in the arguments is logged verbatim (see `strsubstno-prebuild-breaks-error-telemetry-classification` in the privacy domain).
+On a normal page, `DelayedInsert = false` is the default: the record is inserted into the table as soon as the user enters the first field, and subsequent fields are written via `Modify` triggers. That model does not work for an API endpoint, where the consumer sends a complete JSON payload in a single request and expects exactly one `Insert` to fire with all fields already populated. `DelayedInsert = true` defers the insert until every field on the page has been assigned, so the `OnInsert` trigger runs once with the full record and `OnValidate` triggers on individual fields run in a predictable order. The convention is that API pages always set `DelayedInsert = true`.
 
 ## Best Practice
 
-Declare the Label with placeholders and pass arguments directly to Error: `Error(CustomerNotFoundErr, CustomerNo, DocumentNo)`. Use `Comment` on the Label to document each placeholder (see `include-comment-on-labels-with-placeholders`). `Error('')` is acceptable when the caller is responsible for the surfaced error.
+Declare `DelayedInsert = true` on every page with `PageType = API`. The setting plays well with `Modify(true)` and `Insert(true)` calls inside `OnInsert` and avoids the half-populated record states that otherwise reach validation logic.
 
-See sample: `pass-parameters-directly-to-error-no-strsubstno.good.al`.
+See sample: `api-page-delayedinsert-true.good.al`.
 
 ## Anti Pattern
 
-`Error(StrSubstNo(CustomerNotFoundErr, CustomerNo))` — loses translation. `Error(CustomerNotFoundErr + ': ' + CustomerNo)` — loses translation, concatenates hard-coded delimiters. `Error('Customer ' + CustomerNo + ' not found')` — uses no Label at all.
+Omitting `DelayedInsert` (which defaults to `false`) on an API page. Validation triggers fire on a partially populated record, mandatory-field errors come back to the caller for fields the JSON payload was about to supply, and the API surface produces failures that have no analogue in the UI page model.
 
-See sample: `pass-parameters-directly-to-error-no-strsubstno.bad.al`.
+See sample: `api-page-delayedinsert-true.bad.al`.
 
 
-# Prefix temporary record variables with "Temp"
+# `EntityName` is singular; `EntitySetName` is plural
 
 ## Description
 
-A `Record X temporary` variable behaves differently from a persistent Record variable of the same type: Insert/Modify/Delete mutate an in-memory buffer, not the underlying table. Code that mixes persistent and temporary variables of the same type is a recurring source of data-loss bugs — a helper that does `DeleteAll` on what the caller believed was a temporary buffer wipes the real table. The convention across Business Central is to prefix every temporary record variable with `Temp` (`TempJobWIPBuffer`, `TempSalesLine`, `TempCustomer`) so the distinction is visible at every read site, not only at the declaration.
+`EntityName` and `EntitySetName` on an API page are the two halves of the OData naming contract. `EntityName` names a single record — `'customer'`, `'salesOrder'`, `'item'`. `EntitySetName` names the collection — `'customers'`, `'salesOrders'`, `'items'`. Swapping them — `EntityName = 'customers'`, `EntitySetName = 'customer'` — produces URLs that lie to consumers: `GET /customers` returns one row, `GET /customers('id')` returns a collection. The OData conventions consumers rely on for client-side code generation depend on the singular/plural pairing being correct.
 
 ## Best Practice
 
-Prefix every temporary-record variable with `Temp`. The prefix goes on the variable name, not the type; the `temporary` keyword remains on the declaration. Matching the prefix against the declaration makes it a one-line check in code review: if the name starts with `Temp`, the declaration ends in `temporary`, and vice versa.
+Pick the singular noun for `EntityName` and its grammatical plural for `EntitySetName`, both in camelCase. For compound nouns, only the trailing noun is pluralized: `EntityName = 'salesOrder'`, `EntitySetName = 'salesOrders'`. For nouns whose plural is irregular, use the natural English form — `EntitySetName = 'people'` for `EntityName = 'person'`.
 
-See sample: `prefix-temporary-record-variables-with-temp.good.al`.
+See sample: `api-page-entity-naming-singular-plural.good.al`.
 
 ## Anti Pattern
 
-`WIPBuffer: Record "Job WIP Buffer" temporary` — the variable reads like a persistent record in every call site below the declaration. A reviewer scanning a mutation call (`WIPBuffer.DeleteAll()`) cannot tell from the call site whether the effect is in-memory or production.
+`EntityName = 'customers'`, `EntitySetName = 'customer'` — singular and plural swapped. Equally wrong is reusing the same form for both — `EntityName = 'customer'`, `EntitySetName = 'customer'` — which breaks OData metadata parsers and client codegen.
 
-See sample: `prefix-temporary-record-variables-with-temp.bad.al`.
+See sample: `api-page-entity-naming-singular-plural.bad.al`.
 
 
-# Every function call carries parentheses, even with no arguments
+# `APIVersion` must follow the pattern `vX.Y` (or `beta`)
 
 ## Description
 
-AL allows `Customer.Init`, `TempBuffer.DeleteAll`, and `Customer.FindFirst` without trailing parentheses when the method takes no parameters. CodeCop rule AA0008 requires the parentheses anyway. The reason is readability: without `()`, the reader has to know the member is a method and not a property — an ambiguity that resolves differently for the platform's own APIs (FindFirst is a method; `Name` is a field). With `()`, the call site is visibly a method invocation and a simple grep for `Init(` or `DeleteAll(` finds every usage.
+The `APIVersion` property on an API page is part of the public URL path: `/api/<publisher>/<group>/<version>/<entitySetName>`. The platform accepts only two value shapes for it: a `vMAJOR.MINOR` string such as `'v1.0'`, `'v2.0'`, or `'v2.1'`, or the literal string `'beta'` for pre-release endpoints. Anything else — `'v2'`, `'2.0'`, `'1'`, `'v2.0.0'` — is rejected. The major-minor pair lets consumers detect compatibility through URL inspection alone; the explicit `'beta'` channel signals "this contract may break without notice."
 
 ## Best Practice
 
-Always write parentheses on method calls, even when empty: `Customer.Init()`, `TempBuffer.DeleteAll()`, `if Customer.FindFirst() then`. Apply the rule to platform methods and to user-defined procedures alike.
+Start a new public endpoint at `'v1.0'`. Bump the minor when adding fields or non-breaking changes; bump the major when changing field types, removing fields, or any breaking change. Use `'beta'` for endpoints that are still iterating and SHOULD NOT be consumed by external integrations.
 
-See sample: `require-parentheses-on-function-calls.good.al`.
+See sample: `api-page-version-format.good.al`.
 
 ## Anti Pattern
 
-`Customer.Init;`, `TempBuffer.DeleteAll;`, `if Customer.FindFirst then` — all three compile but obscure what is a call and what is a field access. The inconsistency compounds when the same codebase has both conventions.
+`APIVersion = 'v2'` (missing minor), `APIVersion = '2.0'` (missing `v` prefix), `APIVersion = 'v2.0.0'` (extra segment). All three either fail to compile or produce a URL that consumers cannot reach.
 
-See sample: `require-parentheses-on-function-calls.bad.al`.
+See sample: `api-page-version-format.bad.al`.
 
 
-# Use FieldCaption and TableCaption in user messages, not FieldName and TableName
+# `begin` goes on the same line as `then`, `else`, or `do` (CodeCop AA0005)
 
 ## Description
 
-`FieldName` and `TableName` return the object's internal identifier in English — the name the developer typed into the declaration. `FieldCaption` and `TableCaption` return the translated caption for the current user's language. In user-facing messages, errors, confirmations, and notifications, the two pairs diverge the moment the user is running a non-English locale: `FieldName("Location Code")` reads `Location Code` in every language, while `FieldCaption("Location Code")` reads the translated equivalent. Using the wrong one leaks the English identifier into a localized UI and defeats the product's translation work.
+When a compound block follows `then`, `else`, or `do`, the `begin` keyword must sit on the same line as the preceding keyword, separated by exactly one space. `if Condition then begin` and `for i := 1 to N do begin` are correct. The form that puts `begin` on its own line — common in older AL and in languages like Pascal — is flagged by CodeCop AA0005. The rule does not change indentation of the block body; it only governs the placement of `begin` relative to `then`/`else`/`do`.
 
 ## Best Practice
 
-In any string the user will read, use `FieldCaption(<field>)` and `TableCaption`. Reserve `FieldName` and `TableName` for diagnostic and telemetry contexts where the stable English identifier is preferable. The same rule applies to `XmlPort`, `Query`, and other objects with a caption/name pair.
+`if Condition then begin … end;`, `else begin … end;`, `for i := 1 to N do begin … end;`. The block body is indented one level below the `if`/`for` line, and `end;` sits at the same indentation as the line that opened the block.
 
-See sample: `use-fieldcaption-and-tablecaption-in-user-messages.good.al`.
+See sample: `begin-on-same-line-as-then-else-do.good.al`.
 
 ## Anti Pattern
 
-`Confirm(UpdateLocationQst, true, FieldName("Location Code"))`, `Message('Updated %1', TableName())` — both surface English identifiers to a user whose entire UI is in a different language.
+A line that ends with `then` (or `else`, or `do`) and is followed by a line whose only content is `begin`. The compiler accepts it but CodeCop AA0005 flags it; the visual cost is a wasted line per block and a layout that looks alien to readers used to current AL style.
 
-See sample: `use-fieldcaption-and-tablecaption-in-user-messages.bad.al`.
+See sample: `begin-on-same-line-as-then-else-do.bad.al`.
 
 
-# Invoke objects by name, not by numeric ID
+# Block keywords (`end`, `if`, `repeat`, `until`, `for`, `while`, `case`) start a new line (CodeCop AA0018)
 
 ## Description
 
-AL supports calling `Page.RunModal(525, ...)` or `Report.Run(206, ...)` with a bare numeric ID. The platform accepts the number, but the call site loses every signal that makes the code reviewable and refactor-safe: the reader cannot tell which object is being invoked without looking up 525 in the object catalog, and the renumbering of an object in a future release (legal in AL — IDs are not a stable contract) silently retargets the call to a different object. The `Page::"..."` / `Report::"..."` syntax compiles to the same runtime call but makes the target explicit and binds by name, which is the stable identity.
+CodeCop AA0018 requires that the block-introducing keywords `if`, `repeat`, `until`, `for`, `while`, `case`, and the block-terminating keyword `end` always start a new line. Multiple statements packed onto one line — `if A then X() else if B then Y();` written inline, or `for i := 1 to 10 do begin X(i); Y(i); end;` — defeat code review tooling that operates line-by-line and obscure the control flow. The rule does not prohibit short single-statement constructs spread across two lines (`if Cond then X();`); it prohibits packing the entire control structure onto one line.
 
 ## Best Practice
 
-Write `Page.RunModal(Page::"Posted Sales Shipment Lines", SalesShptLine)` and `Report.Run(Report::"Sales - Invoice", true)`. Apply the same rule to `Codeunit.Run`, `XmlPort.Run`, and similar runtime invocations. Reserve numeric IDs for diagnostic tooling that genuinely needs them.
+Each `if`, `else if`, `repeat`, `for`, `while`, and `case` starts a line. Each `end;` (the closing of a `begin … end` block or a `case`) starts a line. Branch bodies are on their own line, indented.
 
-See sample: `use-named-invocations-instead-of-object-ids.good.al`.
+See sample: `block-keywords-start-new-line.good.al`.
 
 ## Anti Pattern
 
-`Page.RunModal(525, SalesShptLine);` — the reader has no idea what page 525 is without a lookup, and a future rename of page 525 or renumber of "Posted Sales Shipment Lines" produces a silent mismatch.
+`if IsContactName then ValidateContactName() else if IsSalespersonCode then ValidateSalespersonCode();` collapses an `if/else if` chain onto a single line; AA0018 flags both the `else` and the second `if`. The same applies to `for i := 1 to 10 do begin DoX(i); DoY(i); end;` — `end` is not at the start of its line.
 
-See sample: `use-named-invocations-instead-of-object-ids.bad.al`.
+See sample: `block-keywords-start-new-line.bad.al`.
 
 
-# Use the `this` keyword for codeunit self-reference
+# Every page field needs a `Caption` (CodeCop AA0225/AA0226)
 
 ## Description
 
-CodeCop rule AA0248 recommends the `this` keyword inside codeunit procedures when referring to the codeunit's own members or passing the codeunit itself to another procedure. AL's scope resolution otherwise blurs global-variable access, local-variable access, and same-codeunit method calls into the same unqualified syntax — a reader of `ValidateCustomer(Customer)` cannot tell at the call site whether `ValidateCustomer` is a local, a global, or a method on a different codeunit in scope. `this.ValidateCustomer(Customer)` removes the ambiguity, and `OtherCodeunit.DoWork(this)` is the only way to pass the current codeunit as a parameter.
+CodeCop AA0225 and AA0226 require every field control to expose a `Caption` property, separately from the field's source name. The caption is what the user sees as the column header or label; the source name is what the code uses to reference the field. Without an explicit `Caption`, AL falls back to the source field's caption — which may be wrong for the page's context — or to the field name itself in code casing, which surfaces internal naming to users and to translators.
+
+Acceptable exceptions: a field whose caption is inherited via `CaptionClass = '3,5,' + CurrencyCode` (or another CaptionClass formula) does not need a literal `Caption`; the formula provides it. API pages and test pages may omit captions because their consumers are not human users. Boolean fields whose name already reads as a sentence — `Enabled`, `Posted`, `Released` — do not need a redundant Caption that repeats the name.
 
 ## Best Practice
 
-In codeunits, prefix same-codeunit method calls with `this.` when the call is ambiguous or when the scope spans more than a few lines. When the current codeunit needs to be passed as an argument, write `this` — there is no alternative syntax. The rule applies to codeunits; pages, reports, and tables have their own scoping.
+`Caption = 'Customer No.';` paired with `ToolTip = 'Specifies …';`. Captions are short, noun-phrase, title-case for primary labels; sentence-case is allowed for descriptive labels that read as a sentence fragment.
 
-See sample: `use-this-keyword-in-codeunits.good.al`.
+See sample: `caption-required-on-page-fields.good.al`.
 
 ## Anti Pattern
 
-`ValidateCustomer(Customer); SomeOtherCodeunit.DoWork(/* this codeunit? */);` — the first call has ambiguous origin, and the second cannot pass the current codeunit without `this`. The style becomes load-bearing as the codeunit grows past a few small procedures.
+A field control with no `Caption` and no `CaptionClass`, or `Caption = '';`. The user sees the internal identifier as the column header and the translation pipeline has nothing to translate.
 
-See sample: `use-this-keyword-in-codeunits.bad.al`.
+See sample: `caption-required-on-page-fields.bad.al`.
+
+
+# `case` action goes on the line after the possibility
+
+## Description
+
+In an AL `case` statement, the action for each label is written on the line that follows the label, not on the same line. `'A': Letter2 := '10';` on a single line is the discouraged form; the convention is `'A':` on one line and `Letter2 := '10';` on the next, indented one level deeper. The exception is when the action is a `begin … end` block — there the `begin` follows the colon on the same line, consistent with the rule for `then begin` / `else begin` / `do begin`.
+
+## Best Practice
+
+Each case label sits on its own line, terminated by `:`. The action below it is indented; multi-statement actions open with `begin` on the label line and close with `end;` on its own line.
+
+See sample: `case-action-on-line-after-possibility.good.al`.
+
+## Anti Pattern
+
+`'A': Letter2 := '10';` (single-line label and action), and `'C': begin Letter2 := '12'; DoSomething(); end;` (everything on one line including the block body). Both defeat per-line diff review and crowd the control flow.
+
+See sample: `case-action-on-line-after-possibility.bad.al`.
+
+
+# Pass parameters directly to `Error()`, do not wrap with `StrSubstNo`
+
+## Description
+
+`Error()` accepts a format string and a variable number of arguments — `Error(SomeLabelErr, Arg1, Arg2)`. The platform performs the substitution itself, which is the path the translation pipeline understands. Wrapping the same call as `Error(StrSubstNo(SomeLabelErr, Arg1, Arg2))` hides the placeholders from the platform and removes the format-string identity from the call-site, so analyzers cannot match the call to its label and translators lose the link between the formatted message and its template. The corresponding anti-pattern for hardcoded strings — `Error('Customer ' + CustomerNo + ' not found')` — is even worse: it builds an untranslatable, unanalyzable string at runtime.
+
+## Best Practice
+
+Declare a `Label` with the `Err` suffix and the appropriate `Comment` for placeholders, then call `Error(YourErr, arg1, arg2)`. The same rule applies to `Message`, `Confirm`, and other UI primitives: format string in, parameters as separate arguments, no `StrSubstNo` wrapper at the call site, no string concatenation. An `Error('')` (empty message) is acceptable when the calling code expects another layer to emit the actual diagnostic.
+
+See sample: `error-passes-parameters-directly-not-strsubstno.good.al`.
+
+## Anti Pattern
+
+`Error(StrSubstNo(CustomerNotFoundErr, CustomerNo))` and `Error(CustomerNotFoundErr + ': ' + CustomerNo)` both defeat the translation and analysis machinery. Reviewers should treat `StrSubstNo` appearing as an argument to `Error`, `Message`, `Confirm`, or `StrMenu` as an unconditional signal to rewrite.
+
+See sample: `error-passes-parameters-directly-not-strsubstno.bad.al`.
+
+
+# Event subscriber parameter names must match the publisher signature
+
+## Description
+
+In AL, an `[EventSubscriber]` procedure is bound to its publisher by event name and parameter list. The parameter names on the subscriber are not a style choice — they must match the names the publisher declared. The compiler validates the match at build time and emits an error if the subscriber renames a parameter. This means a reviewer cannot apply a generic "use better names" pass to subscriber parameters: `Sender`, `Rec`, `xRec`, `RunTrigger`, the table-and-field-specific parameter names a publisher emits — all are dictated by the publisher and must be reproduced verbatim.
+
+## Best Practice
+
+Copy the publisher signature exactly when declaring the subscriber. When in doubt, navigate to the publisher (`OnAfterValidateEvent`, `OnBeforePostSalesDoc`, etc.) and copy its parameter list. Style rules that apply to other locals — descriptive names, no spaces — do not apply to subscriber parameters.
+
+## Anti Pattern
+
+Renaming a publisher parameter to look prettier in the subscriber. The build breaks immediately. More insidiously, a parameter name that happens to match by coincidence in one event publisher but not in a similar one will compile in some versions of BC and fail in others when the publisher signature evolves.
+
+
+# Use FieldCaption/TableCaption (not FieldName/TableName) in user-facing text
+
+## Description
+
+`FieldName` and `TableName` return the developer-facing identifier of a field or table — a fixed English string used in metadata and in code. `FieldCaption` and `TableCaption` return the translated, user-facing label declared by the field's or table's `Caption` property. When the value is embedded in a `Message`, `Error`, `Confirm`, or any other string shown to a user, the caption is the correct source. Otherwise the user sees the English internal name regardless of locale, and any caption change must be re-applied at every call site instead of being picked up from the single point of definition.
+
+## Best Practice
+
+Reach for `FieldCaption("Location Code")` and `TableCaption()` whenever the value flows into a UI primitive. The same rule applies to format parameters: `Error(SomeErr, FieldCaption("Status"), TableCaption(), "Status")` rather than `Error(SomeErr, FieldName("Status"), TableName(), "Status")`. The captions follow the user's language; the names do not.
+
+See sample: `fieldcaption-not-fieldname-in-user-messages.good.al`.
+
+## Anti Pattern
+
+`Message('Updated %1', TableName())` or `Confirm(UpdateLocationQst, true, FieldName("Location Code"))`. The user sees the English internal name in every locale, and any future rename of the caption fails to reach the message.
+
+See sample: `fieldcaption-not-fieldname-in-user-messages.bad.al`.
+
+
+# Name AL source files `<ObjectName>.<ObjectType>.al`
+
+## Description
+
+Each AL source file holds a single object, and the file name is expected to be of the form `<ObjectName>.<ObjectType>.al` — `CustomerCard.Page.al`, `PostSalesInvoice.Codeunit.al`, `NoSeriesTests.Codeunit.al`, `SalesHeader.TableExt.al`. The pattern makes object types greppable from a file listing and lets tooling — symbol search, project explorers, code generators — locate objects without parsing the AL source. Snake-case, lowercase-only, or type-less file names (`customer_page.al`, `tests_noSeries.al`, `PostSalesInvoiceLogic.al`) all break that contract.
+
+## Best Practice
+
+Use PascalCase for the object portion, no spaces, no underscores; the type segment is one of the AL object-type names — `Page`, `Codeunit`, `Table`, `TableExt`, `Report`, `Query`, `XmlPort`, `Enum`, `EnumExt`, `Interface`, `PermissionSet`, `PageExt`, `ReportExt`. The object portion should echo the object's name as it appears in AL.
+
+See sample (file-naming pattern is structural; no AL sample shipped here).
+
+## Anti Pattern
+
+`customer_page.al`, `PostSalesInvoiceLogic.al`, `tests_noSeries.al`. The first uses snake_case and lower-case; the second omits the type segment entirely; the third inverts the order and uses mixed casing. All three break grep, symbol search, and the implicit map between file system and AL object table.
+
+
+# Always write parentheses on procedure calls (CodeCop AA0008)
+
+## Description
+
+AL allows a parameterless procedure to be called without parentheses — `Customer.Init` instead of `Customer.Init()` — and the result is syntactically identical at runtime. CodeCop AA0008 still flags the parenthesis-less form. The reason is twofold: written without parentheses, a procedure call is visually indistinguishable from a property read, which makes BC code harder to scan; and the same identifier may exist as both a property and a procedure on different objects, so the parentheses are the only local signal that this is a call. The rule applies to every parameterless invocation, including `Init`, `Insert`, `Modify`, `Delete`, `DeleteAll`, `FindFirst`, `FindSet`, `Next`, `Get`, `CalcFields`, and user-defined procedures.
+
+## Best Practice
+
+Always write `()` on a procedure call, even when it takes no arguments: `Customer.Init();`, `TempBuffer.DeleteAll();`, `if Customer.FindFirst() then …`. The same applies inside expressions and as a condition.
+
+See sample: `function-call-parentheses-required.good.al`.
+
+## Anti Pattern
+
+`Customer.Init;`, `TempBuffer.DeleteAll;`, `if Customer.FindFirst then …`. Every one of those is an AA0008 violation. Reviewers should treat a parameterless procedure name appearing without parentheses as a defect, even though the compiler accepts it.
+
+See sample: `function-call-parentheses-required.bad.al`.
+
+
+# Document each Label placeholder with the Comment parameter
+
+## Description
+
+`Label` and `TextConst` strings that contain placeholders (`%1`, `%2`, …) need a `Comment` parameter that names what each placeholder is. Translators do not see the call site, so without the Comment they cannot disambiguate `'Customer %1 not found in %2.'` — is `%2` a location code, a posting date, a company name? The pattern is `Comment = '%1 = <description>, %2 = <description>'`. The Comment is not required when the placeholder meaning is obvious from the surrounding text — `'Customer %1'` is unambiguously a Customer No. — but for any non-trivial label the Comment is a hard requirement.
+
+## Best Practice
+
+Write the Comment in the form `'%1 = Customer No., %2 = Sales Header No.'` — one entry per placeholder, matched by ordinal, named in the vocabulary of the BC domain. When the label is reused across multiple call sites, the Comment names the canonical meaning all call sites must conform to.
+
+See sample: `label-comment-explains-placeholders.good.al`.
+
+## Anti Pattern
+
+A label with two or more placeholders and no Comment, leaving the translator to guess. Equally bad is a Comment that only restates the placeholders (`'%1 and %2 are values'`) without naming what they are. Both fail in translation: the localized string ends up grammatically or semantically wrong, and the bug surfaces only in a non-English tenant.
+
+See sample: `label-comment-explains-placeholders.bad.al`.
+
+
+# Set `Locked = true` on Labels that must not be translated
+
+## Description
+
+A `Label` is by default surfaced to translators and rewritten per locale. That is wrong for strings that are not natural language: HTTP verbs (`GET`, `PUT`), URL fragments, JSON/XML snippets, content-type strings, GUIDs, application keys, and field tokens used by integrations. Translating these breaks the integration the moment a non-English tenant runs the code. The `Locked = true` parameter on the Label declaration tells the translation pipeline to keep the string verbatim, and signals to reviewers that the value is part of a wire-level contract rather than display text.
+
+## Best Practice
+
+Pair `Locked = true` with the `Tok` suffix for short tokens (`GetMethodTok: Label 'GET', Locked = true;`) and with the `Txt` suffix for telemetry strings that contain format placeholders but should not be localized. The `Locked` parameter and the `Tok` / `Txt` suffix together make the intent unambiguous.
+
+See sample: `label-locked-for-non-translatable.good.al`.
+
+## Anti Pattern
+
+`HttpsUrl: Label 'https://example.com';` or `ContentTypeTok: Label 'application/json';` declared without `Locked = true`. The translator localizes them, the integration fails in production for the affected tenant, and the failure is invisible in the developer's English-locale tests.
+
+See sample: `label-locked-for-non-translatable.bad.al`.
+
+
+# Use approved suffixes on Label and TextConst names (CodeCop AA0074)
+
+## Description
+
+CodeCop AA0074 flags `Label` and `TextConst` identifiers that do not end with an approved usage suffix. The suffix signals at the call site how the text is consumed and what translation behaviour it should get. The approved suffixes and their intended usage are: `Msg` for text shown via `Message()`; `Err` for text passed to `Error()`; `Qst` for text used with `Confirm` or `StrMenu`; `Lbl` for captions and tooltips; `Tok` for short tokens such as `'GET'`, `'PUT'`, `'HTTPS'`, GUIDs, or JSON/XML snippets that are not translated (typically with `Locked = true`); and `Txt` for general text including telemetry messages. A `Label` named `Text000` or `CannotDeleteLine` without a suffix violates the rule, regardless of how readable the prose is.
+
+## Best Practice
+
+Pick the suffix that matches the call where the label is consumed: `UpdateCompleteMsg` for `Message(...)`, `CustomerNotFoundErr` for `Error(...)`, `DeleteRecordQst` for `Confirm(...)`, `CustomerNameLbl` for tooltips and captions, `GetMethodTok` for locked tokens, `TelemetryDataTxt` for telemetry payloads. Suffix choices between `Tok`, `Lbl`, `Txt`, and `Msg` are judgment calls when the suffix is valid for the usage — what matters is that the suffix is on the approved list and matches the actual call.
+
+See sample: `label-suffix-approved-list.good.al`.
+
+## Anti Pattern
+
+A `Label` declared with no suffix (`CannotDeleteLine: Label '…';`), a generic name (`Text000: Label '…';`), or a suffix that contradicts the usage (`WrongSuffixTok: Label 'Customer %1 not found.'` then passed to `Error()`). All three trip AA0074 or its reviewers and obscure the call-site contract.
+
+See sample: `label-suffix-approved-list.bad.al`.
+
+
+# Declare Labels at object scope, not inside procedure `var` blocks
+
+## Description
+
+`Label` is the AL declaration that participates in the translation pipeline: the build extracts every Label declared in an object into the `.xlf` file shipped to translators, and the runtime substitutes the localized value when the object is loaded. Translation tooling discovers Labels by walking the object's top-level declarations.
+
+Labels declared inside a procedure-local `var` block are still **compiled** as Label values, but their participation in localization is fragile: depending on the BC version, the build pipeline, and the translation toolchain in use, procedure-local Labels may be missed during XLIFF extraction, may be re-emitted with auto-generated keys that change between builds, or may not be addressable by reviewers triaging translations. The reliable, supported pattern is to declare every Label in the object's top-level `var` block.
+
+The same rule applies to all object types that own behavior: codeunits, pages, tables, reports, queries, and their extensions. For shared messages used by multiple objects, declare the Label in the most appropriate owning object and reference it — do not duplicate the literal across procedure-scoped declarations in several places.
+
+## Best Practice
+
+Move every `Label` to the object's top-level `var` block. Use the appropriate suffix (`Msg`, `Err`, `Qst`, `Lbl`, `Tok`, `Txt`) on the variable name so reviewers and the translation team can see at a glance what role the string plays. Pair non-translatable strings (URLs, JSON/XML fragments, integration tokens) with `Locked = true`, as covered by `label-locked-for-non-translatable.md`.
+
+See sample: `labels-declared-at-object-scope.good.al`.
+
+## Anti Pattern
+
+Declaring `Label` inside a procedure-local `var` block — `procedure Lookup() var GreetingMsg: Label 'Hello %1';` — couples the translatable string to one procedure, hides it from object-level review, and depends on a translation pipeline behavior that is not part of the AL language contract.
+
+See sample: `labels-declared-at-object-scope.bad.al`.
+
+
+# Reserved keywords are written in lowercase (CodeCop AA0241)
+
+## Description
+
+CodeCop AA0241 requires reserved AL keywords — `if`, `then`, `else`, `begin`, `end`, `var`, `procedure`, `local`, `internal`, `for`, `while`, `repeat`, `until`, `case`, `of`, `do`, `not`, `and`, `or`, `exit`, `break`, `skip`, `quit`, and the rest — to be lowercase. Old Navision and C/AL code used `IF…THEN…BEGIN…END` in uppercase, and that style still lingers in training data and legacy modules. New AL code is lowercase. The rule applies to keywords only — type names (`Record`, `Codeunit`, `Integer`), property names (`Caption`, `ToolTip`), and identifiers are unaffected.
+
+Test codeunits that retain legacy uppercase forms (`OPENEDIT`, `ASSERTERROR`, `VALUE`) are an accepted exception: the test framework historically uses those identifiers and rewriting them brings no benefit. The rule applies to new code in modified lines, not to long-standing test patterns.
+
+## Best Practice
+
+Write keywords lowercase: `if Condition then begin … end;`, `repeat … until Found;`, `for i := 1 to N do …`. The standard AL formatter normalizes casing automatically.
+
+See sample: `lowercase-reserved-keywords.good.al`.
+
+## Anti Pattern
+
+`IF Condition THEN BEGIN DoSomething(); END;`, `REPEAT GetNext(); UNTIL Found;`. Uppercase keywords trip AA0241 and signal C/AL-era code that has not been modernized.
+
+See sample: `lowercase-reserved-keywords.bad.al`.
+
+
+# Call objects by name, not by numeric ID
+
+## Description
+
+`Page.RunModal`, `Report.Run`, `Codeunit.Run`, and the `Page::`, `Report::`, `Codeunit::`, `Table::`, `XmlPort::` selectors accept either a numeric ID or a named alias. The named form — `Page::"Posted Sales Shipment Lines"`, `Report::"Sales - Invoice"` — is the one to use. Numeric IDs are an implementation detail that change with renumbering, do not survive a rename, and carry no signal to a reader about what the call actually does. The compiler resolves named aliases at build time, so the named form is no slower than the numeric form.
+
+## Best Practice
+
+When invoking an object whose named alias is available in the same app (or in a dependency the current app already references), use the named form: `Page.RunModal(Page::"Posted Sales Shipment Lines", SalesShptLine)`, `Report.Run(Report::"Sales - Invoice", true)`. The same applies to `Codeunit.Run`, `XmlPort.Run`, `Query.Open`, and any platform method that takes an object reference. The named form makes diffs reviewable — a rename is visible — and makes log output and stack traces interpretable.
+
+See sample: `named-invocations-not-object-ids.good.al`.
+
+## Anti Pattern
+
+`Page.RunModal(525, …)` or `Report.Run(206, true)`. The numeric form is unreadable, fragile across renumbering, and breaks every search that looks for callers of a named object.
+
+See sample: `named-invocations-not-object-ids.bad.al`.
+
+
+# Do not wrap a single statement in `begin … end` (CodeCop AA0013)
+
+## Description
+
+CodeCop AA0013 flags `begin … end` blocks that contain exactly one statement. The compound-block syntax exists to group multiple statements as a unit; using it for a single statement adds two lines and a level of nesting without adding meaning. `if IsAssemblyOutputLine then begin TestField("Order Line No.", 0); end;` should be `if IsAssemblyOutputLine then TestField("Order Line No.", 0);` — one statement, no block. The same logic applies after `else`, `for`, `while`, and `repeat`.
+
+## Best Practice
+
+A single statement following `then`, `else`, `do`, or a case label is written on its own line, indented one level, with no `begin … end`. Use `begin … end` only when there are two or more statements to group.
+
+See sample: `no-begin-end-around-single-statement.good.al`.
+
+## Anti Pattern
+
+`if Cond then begin OneCall(); end;` — single statement wrapped in a block. AA0013 flags it. The reviewer signal is "a `begin` followed by exactly one statement before its `end`."
+
+See sample: `no-begin-end-around-single-statement.bad.al`.
+
+
+# Omit `else` when the `then` branch ends with `exit`, `break`, `skip`, `quit`, or `error`
+
+## Description
+
+When the `then` branch of an `if` ends in a terminating statement — `exit`, `break`, `skip`, `quit`, or `error` — the `else` branch becomes the natural fall-through. `if Cond then exit; DoX();` and `if Cond then exit else DoX();` are equivalent, and the second form adds a layer of nesting that the reader has to mentally flatten. The same applies to `Error(...)`: `if IsAdjmtBinCodeChanged() then Error(AdjmtErr) else Error(BinErr);` is better written as `if IsAdjmtBinCodeChanged() then Error(AdjmtErr); Error(BinErr);` — the second `Error` is always reached when the first branch is not taken.
+
+## Best Practice
+
+Drop the `else` when the `then` branch unconditionally exits the procedure or the enclosing loop. The body that would have been inside `else` becomes the unindented continuation.
+
+See sample: `no-else-after-terminating-statement.good.al`.
+
+## Anti Pattern
+
+An `if … then Error(…) else Error(…)` pair where both branches terminate. The `else` is structural noise — the reader cannot tell at a glance whether it exists to handle an actual continuation or simply mirrors the `then`. The fix is to drop `else` and let the second `Error` fall through naturally.
+
+See sample: `no-else-after-terminating-statement.bad.al`.
+
+
+# No space between a method name and its opening parenthesis (CodeCop AA0002)
+
+## Description
+
+CodeCop AA0002 forbids whitespace between a procedure/method name and its `(`. `Customer.Get(CustomerNo)` is correct; `Customer.Get (CustomerNo)` is not. The rule applies to user-defined procedures, system methods (`Insert`, `FindFirst`, `CalcFields`), trigger-style invocations, and the parenthesised cast/conversion forms (`Format(Value)`, `CopyStr(Source, 1, 10)`). The whitespace between `(` and the first argument, and between the last argument and `)`, is also forbidden by the same rule.
+
+## Best Practice
+
+`Customer.Get(CustomerNo)`, `Customer.SetFilter("No.", '%1', '*A*')`, `Message(GreetingMsg, UserName)`. The standard AL formatter enforces this automatically.
+
+See sample: `no-space-before-method-parenthesis.good.al`.
+
+## Anti Pattern
+
+`Customer.Get ( CustomerNo )`, `Message ( GreetingMsg, UserName )`. Both trip AA0002 and read as if the call had an extra unnamed parameter — a small but persistent friction every reader pays.
+
+See sample: `no-space-before-method-parenthesis.bad.al`.
+
+
+# Keep object names within the 30-character platform limit
+
+## Description
+
+Business Central object names — for tables, pages, codeunits, reports, queries, XML ports, enums, and permission sets — are limited to 30 characters in total. AppSource and per-tenant extensions also have to carry a mandatory prefix or affix (typically 3–4 characters), which leaves roughly 26 characters for the descriptive part of the name. Names hitting the 30-character ceiling are routinely rejected at publish time, and over-aggressive abbreviation to fit (`CustLE`, `SIPoster`, `SalesInv`) makes the object name opaque to reviewers and to anyone reading dependency lists. The right move is to plan name length around the budget — descriptive base + prefix — not to discover the limit during AppSource validation.
+
+## Best Practice
+
+Choose a clear, descriptive name in the 20–26-character range and reserve the remaining characters for the mandatory app prefix. `"Customer Ledger Entry"`, `"Sales Invoice Posting"`, `"Sales Invoice"` are descriptive and well under the budget. When you genuinely need to abbreviate, prefer abbreviations that are already established in BC (`Cust.`, `Vend.`, `Gen. Jnl.`, `WHSE`) over ad-hoc shortenings.
+
+## Anti Pattern
+
+Names like `"CustLE"` or `"SIPoster"` that abbreviate beyond comprehensibility, or names like `"Customer Ledger Entry Posting Helper Codeunit"` that breach 30 characters and force a rename during publish.
+
+
+# Option fields need `OptionCaption`, and its element count must match `OptionMembers` (CodeCop AA0221/AA0223/AA0224)
+
+## Description
+
+CodeCop AA0221 requires an `OptionCaption` on every option-type field that is not sourced from a table column (table-sourced option fields inherit the captions of the underlying field). AA0223 and AA0224 add two integrity checks: the number of comma-separated entries in `OptionCaption` must equal the number of entries in `OptionMembers`, and each caption must align by position with its member. The position alignment is what the platform uses to translate option values — the `OptionMembers` list never changes per locale, the `OptionCaption` list does. A mismatch in count or order produces silent corruption: the option `Released` shows the caption that belongs to `Pending`, and the bug is locale-dependent.
+
+## Best Practice
+
+`OptionMembers = Open,Released,Pending;` and `OptionCaption = 'Open,Released,Pending';` — same count, same order. When adding a new member, update both lines in the same commit.
+
+See sample: `optioncaption-required-and-matches-membercount.good.al`.
+
+## Anti Pattern
+
+`OptionMembers = Open,Released,Pending;` with no `OptionCaption` at all (the user sees the raw English members and translation is impossible), or `OptionMembers = Low,Medium,High,Critical;` paired with `OptionCaption = 'Low,Medium,High';` — count mismatch, `Critical` displays as blank or carries the wrong caption depending on platform version.
+
+See sample: `optioncaption-required-and-matches-membercount.bad.al`.
+
+
+# A page or view name must describe the table it shows
+
+## Description
+
+A page (or filtered page View) whose name references one entity but whose `SourceTable` is a different entity misleads every consumer of the object's metadata. A page named `"Items with Negative Inventory"` that sources `"Stockkeeping Unit"` looks like a list of items in the search bar and in role explorer, but presents stockkeeping-unit fields and behaviour. The fix is either to rename the page to match the source table — `"Stockkeeping Units with Negative Inventory"` — or to change the source table to the entity the name promises. The choice depends on which the actual users are asking for; the constraint is that the two MUST agree.
+
+The rule extends to filtered Views declared inside a page: the `View` name should describe the filter applied to the page's existing source, not introduce a different entity.
+
+## Best Practice
+
+Read the page name out loud and ask: "If a user typed this into the search bar, would they expect to see rows from `<SourceTable>`?" If the answer is no, rename one side or the other. The same check applies whenever the source table changes — the name has to follow.
+
+## Anti Pattern
+
+`page "Items with Negative Inventory" { SourceTable = "Stockkeeping Unit"; … }`. The Tell-Don't-Ask name asserts items; the source contradicts it. Reviewers should flag every mismatch they spot, even when both sides "make sense individually" — they have to agree.
+
+
+# Exactly one space between `not` and its argument (CodeCop AA0003)
+
+## Description
+
+CodeCop AA0003 requires exactly one space between the `not` operator and the expression it negates. `if not Customer.FindFirst() then …` is correct; `if not  Customer.FindFirst() then …` (two spaces) and `if notCustomer.FindFirst() then …` (zero — which fails parsing anyway) are not. The rule is also the place where uppercase `NOT` is flagged in combination with CodeCop AA0241 (reserved keywords must be lowercase): `if NOT Condition then` is doubly wrong.
+
+## Best Practice
+
+`if not Condition then`, `if not Customer.IsEmpty() then`, `exit(not Result)`. One space, lowercase keyword, no parentheses around the bare boolean.
+
+See sample: `single-space-after-not-operator.good.al`.
+
+## Anti Pattern
+
+`if NOT condition then`, `if not  condition then`, `if !condition then` (which is not even AL — `!` is not a negation operator in AL). All three either trip AA0003 / AA0241 or fail to compile.
+
+See sample: `single-space-after-not-operator.bad.al`.
+
+
+# One space on each side of every binary operator (CodeCop AA0001)
+
+## Description
+
+CodeCop AA0001 requires exactly one space on each side of every binary operator: assignment (`:=`), arithmetic (`+`, `-`, `*`, `/`, `mod`, `div`), comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`), logical (`and`, `or`, `xor`), and string concatenation. `x:=1+2`, `Price:=Amount*Quantity`, `if a=b then`, and `if a and b then` all violate the rule. The rule applies to the binary use of `-` (subtraction); the unary minus (`-Profit`) takes no leading space.
+
+## Best Practice
+
+Write `x := 1 + 2`, `Price := Amount * Quantity`, `if a = b then`, `if a and b then`. The standard AL formatter inserts these spaces automatically; running `Alt+Shift+F` (Format Document) in the AL extension is the simplest way to bring an entire file into compliance.
+
+See sample: `single-space-around-binary-operators.good.al`.
+
+## Anti Pattern
+
+`x:=1+2;`, `Price:=Amount*Quantity;`, `if a=b then`, `if a and b then`. All trip AA0001.
+
+See sample: `single-space-around-binary-operators.bad.al`.
+
+
+# Telemetry event IDs must be stable, unique, and non-placeholder
+
+## Description
+
+The first parameter of `Session.LogMessage` is the **event ID**. Telemetry consumers — Application Insights queries, KQL dashboards, alert rules, support runbooks — pivot on this ID to filter and aggregate events. The contract works only when the ID is:
+
+- **Stable** across releases: the same logical event keeps the same ID, so existing queries continue to match it.
+- **Unique** within the extension's telemetry catalogue: two different events MUST NOT share an ID, or downstream consumers cannot distinguish them.
+- **Non-placeholder**: literal IDs like `'0000'`, `'1234'`, `'TODO'`, or `'XX0000'` are placeholders that collide with other placeholder-using extensions, are unsearchable, and indicate the catalogue entry was never registered.
+
+The convention used by Microsoft first-party AL code is a short prefix identifying the publisher or feature followed by a numeric suffix — for example `'AL0001'`, `'CUST0042'`, `'SHPFY-0007'`. The exact format is up to the extension; the requirements are stability, uniqueness, and that the chosen ID is registered in whatever catalogue or wiki the extension's telemetry consumers reference.
+
+## Best Practice
+
+Assign each `Session.LogMessage` call a real, registered event ID drawn from the extension's catalogue. Treat the ID as part of the public contract of the event — renaming it is a breaking change for consumers. Keep IDs short, deterministic, and free of personal or environment-specific tokens.
+
+See sample: `telemetry-event-id-stable-unique.good.al`.
+
+## Anti Pattern
+
+Calling `Session.LogMessage('0000', ...)` (or `'1234'`, `'TODO'`, an empty string, a GUID generated at runtime, or any other placeholder) leaves the event unsearchable and indistinguishable from every other event using the same placeholder. The catalogue entry never gets created because the developer "will fix it later", and the placeholder ships.
+
+See sample: `telemetry-event-id-stable-unique.bad.al`.
+
+
+# Prefix temporary record variables with `Temp`
+
+## Description
+
+A `Record` variable declared with the `temporary` modifier behaves nothing like a normal record variable: it never touches the database, holds rows only for the lifetime of the variable, and is not visible to filters or queries on the underlying table. The BC convention is to make that difference visible at every call site by prefixing the variable name with `Temp` — `TempJobWIPBuffer`, `TempSalesLine`, `TempIntegerBuffer`. The convention is load-bearing for code review: when a reader sees `SalesLine.Insert()`, they expect a database write; when they see `TempSalesLine.Insert()`, they know it is an in-memory buffer.
+
+## Best Practice
+
+Every variable of type `Record X temporary` must start with `Temp`. The same applies to parameters: a procedure that receives a temporary record as a buffer names the parameter `TempBuffer`, `TempSalesLine`, and so on. The convention extends naturally to derived names — `TempJobWIPBufferCopy`, `TempSourceSalesLine` — anything that starts with `Temp` is in-memory.
+
+See sample: `temporary-variable-temp-prefix.good.al`.
+
+## Anti Pattern
+
+`WIPBuffer: Record "Job WIP Buffer" temporary;` reads at the call site as if it were a database operation: `WIPBuffer.Insert()` looks identical to a write to the underlying table. The reader has to scroll back to the declaration to discover that this is in-memory, every time.
+
+See sample: `temporary-variable-temp-prefix.bad.al`.
+
+
+# Use the `this` keyword for self-reference inside codeunits (CodeCop AA0248)
+
+## Description
+
+CodeCop AA0248 recommends prefixing self-references inside a codeunit with `this`. `this.ValidateCustomer(Customer)` is unambiguous: the call resolves to a procedure on the current codeunit, not to a local variable or a procedure on a passed-in object. Without the prefix, a reader of a 200-line procedure has to scan the whole codeunit to confirm whether `ValidateCustomer` is local. `this` also makes it possible to pass the current codeunit as an argument — `SomeOtherCodeunit.DoWork(this)` — which is the only way to expose the running codeunit instance to a collaborator. The rule applies only to codeunits, not to pages, reports, queries, or tables — those object types do not have a `this` reference in AL.
+
+## Best Practice
+
+Inside a codeunit, prefix calls to procedures and accesses to global variables on the same codeunit with `this.`, and pass `this` when an external codeunit needs a reference to the running instance.
+
+See sample: `this-keyword-in-codeunits.good.al`.
+
+## Anti Pattern
+
+Calling a codeunit-local procedure as a bare identifier (`ValidateCustomer(Customer)`) when other readings are possible. The ambiguity costs reading time on every encounter and grows with codeunit size.
+
+See sample: `this-keyword-in-codeunits.bad.al`.
+
+
+# Every page field needs a `ToolTip` (CodeCop AA0218)
+
+## Description
+
+CodeCop AA0218 requires a non-empty `ToolTip` property on every field control on a page. The tooltip is what users see on hover and is what screen readers announce; an empty or missing tooltip removes a piece of UI affordance that is part of BC's accessibility baseline. AppSource technical validation rejects pages with missing tooltips. The companion rules AA0219 and AA0220 push the wording further — tooltips should describe what the field shows, conventionally starting with `'Specifies …'`, though `'Shows …'` and similar variants are acceptable when they clearly describe the field's purpose.
+
+Acceptable exceptions: table fields inside `Upgrade`, `Migration`, `HybridBC14`, `HybridSL`, and `HybridGP` codeunits and tables are allowed to omit the tooltip — those types are not surfaced to users.
+
+## Best Practice
+
+Every field control on a regular page carries `ToolTip = 'Specifies …';` (or a clear alternative phrasing). Compose the text in the form "what this value shows" rather than "what the user does with it".
+
+See sample: `tooltip-required-on-page-fields.good.al`.
+
+## Anti Pattern
+
+A field control with no `ToolTip` property at all, or `ToolTip = '';`. AA0218 flags both; the hover state is blank and the screen reader has nothing to announce.
+
+See sample: `tooltip-required-on-page-fields.bad.al`.
+
+
+# Order variable declarations by type, complex types first (CodeCop AA0021)
+
+## Description
+
+CodeCop AA0021 requires that variable declarations inside a `var` block follow a fixed ordering by type, with complex (composite) types appearing before primitive types. The canonical order is `Record`, then `Report`, `Codeunit`, `XmlPort`, `Page`, `Query`, `Notification`, `BigText`, `DateFormula`, `RecordId`, `RecordRef`, `FieldRef`, `FilterPageBuilder`, then the simple types `Text`, `Code`, `Integer`, `Decimal`, `Boolean`, `Date`, `Time`, `DateTime`, `Char`, `Byte`. Inside each type group the variables can be alphabetical or in usage order. Temporary records still sort under `Record`.
+
+## Best Practice
+
+Declare all `Record` variables first, then other complex types, then primitives. A consistent order makes diffs review-friendly and matches the convention enforced by the AL formatter and CodeCop.
+
+See sample: `variable-declaration-order-by-type.good.al`.
+
+## Anti Pattern
+
+A `var` block where records and primitives are interleaved — `CustomerNo: Code[20];` between two `Record` variables, or `Amount: Decimal;` declared above the `Customer: Record Customer;` it is computed from. AA0021 flags it and the block is harder to scan; readers expect composite types at the top.
+
+See sample: `variable-declaration-order-by-type.bad.al`.
+
+
+# Local variable names must not shadow globals, fields, methods, or actions (CodeCop AA0198/AA0202/AA0204)
+
+## Description
+
+Three CodeCop rules — AA0198, AA0202, AA0204 — together forbid a local variable from sharing a name with a global variable on the same object, with a field on the same table or page source, with a procedure on the same object, or with an action on the same page. The compiler resolves the conflict by binding the closer scope, so a local `Customer: Text` will silently override a global `Customer: Record Customer` for the duration of a procedure — every call site reading `Customer.Name` from inside that procedure refers to the text, and the breakage is invisible to a reader who has both declarations on screen.
+
+## Best Practice
+
+Differentiate every local declaration from globals, fields, procedures, and actions on the same object. `Customer` global plus `CustomerName` local; method `GetAmount` plus local `SalesAmount`. The standard pattern is to attach a noun suffix to the local (`CustomerName`, `CustomerRec`, `CustomerNo`) rather than to the global.
+
+See sample: `variable-name-must-not-shadow.good.al`.
+
+## Anti Pattern
+
+A procedure that declares a local `Customer: Text` inside a codeunit that already has a global `Customer: Record Customer`. The local wins and the global becomes unreachable inside the procedure. AA0198/AA0202/AA0204 flag this category of conflict whether the colliding entity is a global, a field, a method, or an action.
+
+See sample: `variable-name-must-not-shadow.bad.al`.
+
+
+# Add XML documentation to public procedures on library/API codeunits
+
+## Description
+
+XML documentation comments (`/// <summary>…</summary>`, `/// <param>…</param>`, `/// <returns>…</returns>`) are expected on procedures that form the public surface of a library — codeunits intended to be called from outside the current app: System App modules, AppSource library codeunits, `Access = Public` codeunits exposed for extension. The supported tags are `<summary>`, `<param>`, `<returns>`, `<example>`, `<remarks>`, and `<paramref>`. Active wording is preferred — `'Sets…'`, `'Gets…'`, `'Specifies…'` — and the docs should list parameter preconditions and any exceptions the procedure may raise.
+
+XML docs are NOT required on internal procedures, event subscribers, trigger implementations, page-part procedures, test procedures, or the object declarations themselves (tables, pages, codeunits). The reviewer signal is a `procedure` (not `local procedure`, not `internal procedure`) declared inside a codeunit whose role is "library" — those need XML docs; everything else is optional.
+
+## Best Practice
+
+For every public procedure on a library codeunit, write a `<summary>` describing what the procedure does, one `<param>` per parameter naming its role and preconditions, and `<returns>` describing the return when applicable. Avoid placeholder text — `<summary>Validates discount</summary>` is no better than no doc at all.
+
+## Anti Pattern
+
+A public procedure on a library codeunit with no XML doc, or a `<summary>` that restates the procedure name in three words. The first leaves consumers guessing at intent; the second wastes the slot a meaningful description should occupy.
 
 
 # Match TransactionModel to the commit behavior of the code under test
@@ -1491,376 +1899,714 @@ Applying `AutoRollback` to every test method without checking whether the tested
 See sample: `transactionmodel-attribute-governs-test-transactions.bad.al`.
 
 
-# Action tooltips are imperative, verb-first sentences ending with a period
+# Control add-in accessibility is the developer's responsibility
 
 ## Description
 
-Action tooltips describe what the user will cause by invoking the action. The house style is an imperative verb-first sentence — `Post the current sales invoice and finalize the transaction.` — not a declarative one ("This will post …") and not a fragment ("Post invoice"). The imperative voice matches how the user reads the action bar: each tooltip completes the sentence "If I click this, the system will …" in the same grammatical form. Shortcut-key hints, when present, belong at the end of the tooltip and are retained verbatim.
+When a developer builds a JavaScript control add-in, they bypass the Business Central framework's built-in accessibility support and take full responsibility for the accessibility of the rendered HTML, JavaScript, and CSS. Unlike standard AL page controls, an add-in receives no automatic ARIA semantics, no automatic keyboard handling, and no automatic high-contrast support from the BC client.
+
+Control add-in code must be reviewed for WCAG 2.1 AA compliance and general accessibility best practices. Automated review is inherently non-exhaustive — many accessibility issues (keyboard flow, screen reader announcements, dynamic behavior) require manual testing.
 
 ## Best Practice
 
-Start the tooltip with the verb. Use Sentence case, end with a period, stay within the ~250-character budget. Keep one sentence unless the action genuinely needs two; avoid editorializing ("Easily post …") or narrating ("This action posts …"). Preserve any existing shortcut annotation.
+Treat every UI-rendering change to a control add-in as something the platform will not catch for you: accessible names, semantic HTML, keyboard reachability, focus management, contrast, and reflow are all yours to verify. When reporting issues in control add-in code, include a recommendation that a manual accessibility review accompany any control add-in that renders a UI.
 
-See sample: `action-tooltips-are-imperative-and-end-with-period.good.al`.
+
+# Control add-ins cannot use BC color tokens or theming
+
+## Description
+
+A JavaScript control add-in has no access to Business Central's color tokens or theming system. The BC client will not push theme variables, accent colors, or high-contrast palettes into the add-in's iframe. As a result, the add-in must handle Windows contrast themes independently — for example by responding to the `forced-colors` CSS media query or an equivalent mechanism, and by ensuring its own contrast ratios meet WCAG AA (4.5:1 for normal text, 3:1 for large text and UI components) against the backgrounds it draws.
+
+## Best Practice
+
+Style control add-ins with explicit colors that are known to meet contrast requirements, and add a `forced-colors` (or equivalent) branch so that Windows high-contrast users see a usable rendering. Do not assume that the add-in inherits BC's theme — verify the rendered output in default, dark, and high-contrast themes.
+
+
+# Cosmetic styles need no textual context
+
+## Description
+
+A field's `Style` property controls text formatting. Some style values are purely **cosmetic** — they change visual appearance but do not convey semantic meaning. Cosmetic styles never require additional context and must not be reported as accessibility findings:
+
+- `None`, `Standard`
+- `StandardAccent` (Blue)
+- `Strong` (Bold), `StrongAccent` (Blue + Bold)
+- `Attention` (Red + Italic), `AttentionAccent` (Blue + Italic)
+- `Subordinate` (Grey)
+
+This list is exhaustive — every other named style on the platform either falls outside the cosmetic set or is one of the three semantic styles documented in `semantic-styles-need-independent-textual-meaning.md`.
+
+The same rule applies whether the cosmetic style is set via `Style` directly or via a `StyleExpr` Text variable. If the resolved value at runtime is one of the cosmetic styles above, the field is safe.
+
+## Best Practice
+
+Use cosmetic styles freely for visual emphasis. Do not treat the use of `Attention`, `Strong`, or any other cosmetic value as an accessibility issue — the colors and weights are purely presentational and carry no meaning a screen reader needs to convey.
+
+
+# Grid and fixed-layout data-table heuristic
+
+## Description
+
+Business Central renders `grid()` and `fixed()` layouts in two modes. The mode is chosen automatically by a client heuristic. A grid renders as a **data table** (HTML `<table>` with row/column semantics) only when **all** of the following are true:
+
+- All direct children of the grid/fixed are groups (no loose fields).
+- Every child of every group is a field (no nested groups or other controls).
+- All fields have `ShowCaption = false`.
+
+The heuristic checks field captions only — group `ShowCaption` is not part of the check. A group with a visible caption inside a data-table grid does **not** break the heuristic and is not a violation. However, groups in a data table should also have `ShowCaption = false` for correct visual presentation.
+
+Any grid or fixed layout that does not meet all three conditions renders as a layout table (visual column arrangement, no table semantics).
+
+## Best Practice
+
+If you intend a grid or fixed layout to render as a data table, satisfy all three conditions and verify the resulting markup matches your intent. If you do not need tabular semantics, prefer simple groups over grid or fixed layouts — they reflow better and produce correct semantic markup automatically.
+
+See sample: `grid-data-table-heuristic.good.al`.
+
+
+# Group caption quality is not an accessibility issue
+
+## Description
+
+Group captions affect page organization, but missing, generic, or duplicate group captions are **not** accessibility violations per the BC accessibility rules. Do not flag groups for missing, generic, or duplicate captions during an accessibility review.
+
+This rule prevents a common false positive: LLM-driven reviewers tend to flag "GroupName" or duplicated `Caption = 'General'` as accessibility issues, but the BC client does not depend on group captions for screen-reader announcements of the fields within. Caption quality belongs to other review domains (UI text / style), not accessibility.
+
+## Best Practice
+
+Treat group caption quality as a UI-text concern reviewed elsewhere. Accessibility findings on groups should be limited to the specific patterns documented in the `grid-data-table-heuristic.md`, `tabular-intent-requires-data-table-conditions.md`, and `group-labeled-first-child-exception.md` files.
+
+
+# Group-labeled first child exception
+
+## Description
+
+`ShowCaption = false` is acceptable on an editable field only when **all** of the following conditions are met:
+
+1. The control is the **first visible field** in its parent group.
+2. The field has `ShowCaption = false`.
+3. The parent group has a visible caption: `ShowCaption` is true (the default) **and** the group has a non-empty `Caption` value.
+
+When these three conditions hold, the group caption becomes the accessible label for the field. This works regardless of whether the field is multiline. The presence of `InstructionalText` on the field is irrelevant to this check.
+
+## Best Practice
+
+Do not second-guess this exception. If the three conditions are met, the pattern is acceptable — even if the group caption seems generic (e.g. "General Information") or does not exactly match the field name.
+
+See sample: `group-labeled-first-child-exception.good.al`.
 
 ## Anti Pattern
 
-`ToolTip = 'This will post the invoice'` — declarative rather than imperative, no period. `ToolTip = 'Post'` — one-word fragment that duplicates the Caption and says nothing new. Both fail the scan-the-action-bar comprehension test.
+If the parent group has `ShowCaption = false` or no `Caption`, the first-child exception does not apply: the field has no accessible label anywhere.
 
-See sample: `action-tooltips-are-imperative-and-end-with-period.bad.al`.
+See sample: `group-labeled-first-child-exception.bad.al`.
 
 
-# Avoid banned UI terms; prefer the inclusive and direct replacements
+# Group ShowCaption = false outside grid/fixed is a layout choice
 
 ## Description
 
-Business Central's UI voice guidelines exclude four terms that carry connotations the product does not want to push onto users: "Disabled" (clinical/negative), "Invalid" (pejorative), "Whitelist" and "Blacklist" (terms with racial associations the industry has moved away from). The replacements read naturally, match the product's warm-and-direct voice, and align with Microsoft's cross-product terminology. The concern applies to user-visible text — captions, tooltips, error messages, notifications — not to variable names or code comments.
+In a standard Card or Document page, a group with `ShowCaption = false` is a layout choice, not an accessibility violation. Only flag `ShowCaption` issues as documented in the grid/fixed-layout and field-level `ShowCaption` rules — `show-caption-on-editable-fields.md`, `grid-data-table-heuristic.md`, `tabular-intent-requires-data-table-conditions.md`.
+
+The heuristic in BC's client uses **field** captions to decide between data-table and layout-table rendering. A captionless group (outside a grid or fixed layout) does not strip labels from its child fields — each field retains its own caption.
 
 ## Best Practice
 
-Replace "Disabled" with "Turned off" or "Not available". Replace "Invalid" with "Not valid" or "Incorrect". Replace "Whitelist" with "Allow list". Replace "Blacklist" with "Block list". Apply the substitution in all UI text surfaces: Caption, ToolTip, AboutTitle, AboutText, Label values, Message/Confirm/Error strings.
+Reserve accessibility findings for hidden **field** labels and grid-semantics problems. Do not raise a finding merely because a `group` block has `ShowCaption = false` in an ordinary Card or Document page layout.
+
+
+# Layout-table grids with visible captions are valid
+
+## Description
+
+A grid or fixed layout that does not meet all three data-table conditions renders as a **layout table**. A layout table where editable fields keep their visible captions is not an accessibility violation. Each field is labeled by its own caption — this is a valid, accessible pattern.
+
+Do not flag a grid or fixed layout as an accessibility issue merely because it does not meet the data-table heuristic. The violation is hidden labels in a non-data-table grid, not the layout choice itself.
+
+## Best Practice
+
+When reviewing a grid or fixed layout, first check whether it meets all data-table conditions. If yes, `ShowCaption = false` on fields is correct. If no, allow editable fields to keep their captions and only flag the cases enumerated in `tabular-intent-requires-data-table-conditions.md`.
+
+
+# Nested grids are not supported
+
+## Description
+
+A grid nested inside another grid is not a supported pattern in Business Central. Even if an inner grid independently meets the data-table heuristic, the outer grid fails because its groups contain non-field children (the inner grids). The result is broken table semantics for both layers.
+
+Always flag a nested grid as a violation. The fix is to restructure the page so there is at most one grid in any branch of the layout tree, choosing either a data-table or a layout-table arrangement.
 
 ## Anti Pattern
 
-`ErrorLbl: Label 'Invalid input.'`, `Caption = 'Disabled Users'`, `ToolTip = 'Specifies the blacklist of blocked senders.'` — all three terms in places the user will read. The fix is literal substitution with the approved alternative.
+Wrapping a working data-table grid inside another grid in an attempt to compose two tabular regions side by side. The outer grid silently degrades to layout-table rendering, the inner grid's headers are no longer associated with the outer structure, and editable fields with `ShowCaption = false` lose their labels.
+
+See sample: `no-nested-grids.bad.al`.
 
 
-# Capitalize captions by phrase type: noun phrase is Title Case, sentence phrase is Sentence case
+# OnDrillDown on non-editable fields renders as a link
 
 ## Description
 
-Business Central UI captions follow a simple capitalization rule that depends on the grammatical shape of the caption, not its location. A caption that is a pure noun phrase — no verb — uses Title Case: each major word capitalized (`Sales Orders`, `Chart of Accounts`, `Payment Terms`). A caption that is an imperative or declarative sentence phrase — contains a verb — uses Sentence case: only the first word and proper nouns capitalized (`Post and print`, `Send email`, `Create flow`). Following the rule makes unrelated captions feel consistent; ignoring it is visibly inconsistent in the user's navigation.
+The Business Central client renders non-editable fields that have an `OnDrillDown` trigger as HTML `<a>` (anchor) elements. Screen readers correctly announce these as links. `OnDrillDown` on a non-editable field is therefore **not** an accessibility issue — the platform handles the semantics.
+
+Do not flag `OnDrillDown` usage as an accessibility issue. The combination of `Editable = false` and `OnDrillDown` is the standard BC pattern for navigable, screen-reader-friendly value cells in list and card pages.
 
 ## Best Practice
 
-Decide by parsing the caption as a phrase. "Sales Orders" is a thing; Title Case. "Post and print" tells the user to do something; Sentence case. For captions that are literally a single noun (`Save`, `Close`), treat them as sentence phrases — the imperative verb is implied.
+Use `OnDrillDown` freely on non-editable fields when you want users to navigate from a value to a related record or detail page. No additional ARIA attributes or accessible-name workarounds are required.
 
-See sample: `caption-capitalization-noun-phrase-vs-sentence-phrase.good.al`.
+
+# Semantic styles in a cuegroup are auto-labeled
+
+## Description
+
+Fields inside a `cuegroup` render as cue tiles. The Business Central client automatically provides an accessible label for semantic styles on cue tiles (for example, "Favorable", "Unfavorable"). Semantic styles in a `cuegroup` therefore do **not** need additional context and should be ignored when checking that semantic colors are backed by text.
+
+This is a narrow platform exception to `semantic-styles-need-independent-textual-meaning.md`. Outside a `cuegroup`, the normal rule applies.
+
+## Best Practice
+
+You may apply `Favorable`, `Unfavorable`, or `Ambiguous` to fields inside a `cuegroup` without supplying a redundant textual indicator — the platform supplies the screen-reader text. Reserve this shortcut for cue tiles only; do not extend it to other layout containers.
+
+See sample: `semantic-style-in-cuegroup-exception.good.al`.
+
+
+# Semantic styles need independent textual meaning
+
+## Description
+
+Three `Style` values carry semantic meaning through color and must be backed by text that conveys the same meaning:
+
+- `Favorable` (Bold + Green) — implies a positive outcome.
+- `Unfavorable` (Bold + Italic + Red) — implies a negative outcome.
+- `Ambiguous` (Yellow) — implies an uncertain or mixed outcome.
+
+For accessibility, assume the style is completely invisible to the user. The semantic meaning must be independently determinable from at least one of:
+
+1. The **field caption** matches the semantic meaning (e.g. caption "Error" with `Style = Unfavorable`, or "Profit" with `Style = Favorable`).
+2. The **field value** communicates the meaning (e.g. value "Success!" with Favorable, a negative number with Unfavorable).
+3. An **adjacent field** provides a textual representation of the semantic meaning (e.g. a "Status" column reads "High" / "Medium" / "Low" alongside a percentage field).
+
+The rule applies equally whether `Style` is set to a literal value or to a variable that evaluates to a semantic style at runtime.
+
+## Best Practice
+
+When you reach for `Favorable`, `Unfavorable`, or `Ambiguous`, verify that the caption, value, or an adjacent column already conveys the same meaning. See sample: `semantic-styles-need-independent-textual-meaning.good.al`.
 
 ## Anti Pattern
 
-Writing `Caption = 'Sales orders'` on a list page (noun phrase styled as a sentence) or `Caption = 'Post And Print'` on an action (sentence phrase styled as title case). Both read as typos to a native English reader and inconsistent to a translator.
-
-See sample: `caption-capitalization-noun-phrase-vs-sentence-phrase.bad.al`.
+Applying a semantic style for purely cosmetic emphasis (e.g. green company name for aesthetics), or using semantic colors where only the color reveals the threshold (e.g. confidence percentages with no qualitative label). See sample: `semantic-styles-need-independent-textual-meaning.bad.al`.
 
 
-# Field tooltips start with "Specifies" and end with a period
+# ShowCaption = false on non-editable fields
 
 ## Description
 
-Field tooltips describe what a value means, and the Business Central house style for them is a declarative sentence that starts with "Specifies" and ends with a period. The convention is not cosmetic: it yields a consistent voice across thousands of fields so a user scanning several tooltips in quick succession can compare them without re-parsing each opening clause. Alternative phrasings ("Shows …", "The …") are accepted when they describe the field clearly, but "Specifies …" is the default and the easiest to translate consistently.
+When a field is explicitly non-editable (`Editable = false`), it serves as content rather than as a form field. In that case, `ShowCaption = false` is acceptable: there is no input control whose label could be lost. The combination signals to a reviewer (and to the platform) that the field displays a value standalone — for example a status message or a description that is meaningful on its own.
+
+This exception does **not** extend to dynamically editable fields. A field with `Editable = SomeBooleanExpression` may be editable at runtime and must keep its caption.
 
 ## Best Practice
 
-Write field tooltips as `Specifies <what the field represents>.` — a single sentence, Sentence case, terminating period. Keep under the ~250-character tooltip budget (see `respect-ui-text-character-limits`). When the field's meaning is genuinely not a "specifies" sentence, use "Shows …" or a clearly descriptive alternative; avoid bare fragments.
+If you want to hide a field's caption, pair `ShowCaption = false` with a literal `Editable = false`. Use this pattern only for content fields that do not act as labels for other fields in the same layout container.
 
-See sample: `field-tooltips-start-with-specifies-and-end-with-period.good.al`.
+See sample: `show-caption-false-allowed-on-non-editable-fields.good.al`.
+
+
+# ShowCaption in a PromptDialog prompt area
+
+## Description
+
+On `PageType = PromptDialog` pages, input fields inside `area(Prompt)` are labeled by the dialog's heading — the page `Caption`. Setting `ShowCaption = false` on such an input field is the standard pattern and should not be flagged, provided the page has a `Caption`.
+
+Fields in the `area(Content)` section of the same PromptDialog page are **not** labeled by the dialog heading and follow the normal `ShowCaption` rules.
+
+## Best Practice
+
+In a PromptDialog, give the page a meaningful `Caption` (the dialog heading) and let prompt-area input fields hide their own captions. Treat content-area fields like any other editable field — keep their captions.
+
+See sample: `show-caption-in-promptdialog-prompt-area.good.al`.
+
+
+# ShowCaption inside a repeater is harmless
+
+## Description
+
+Fields inside a `repeater()` control are labeled by their **column headers**, not by their own captions. `ShowCaption = false` on a field inside a repeater is harmless and should not be flagged.
+
+This is the explicit behaviour of the Business Central client: a repeater renders as a tabular list whose column headings come from each field's `Caption` (or source-table caption), and individual row cells do not announce a per-cell caption.
+
+## Best Practice
+
+Inside a repeater, you may set `ShowCaption = false` on fields without losing accessibility. The column header still provides the label for every cell in that column. Outside a repeater, the rules in `show-caption-on-editable-fields.md` apply.
+
+See sample: `show-caption-in-repeater-allowed.good.al`.
+
+
+# ShowCaption on editable fields
+
+## Description
+
+`ShowCaption` must remain true (the default) on editable fields unless the field matches one of the officially supported "magic patterns". Fields are editable by default. Setting `ShowCaption = false` on an editable field is almost always an accessibility bug: without a visible caption, screen reader users lose the label that identifies the field, and sighted users lose a visual cue.
+
+A field whose `Editable` property is a Boolean expression (e.g. `Editable = IsEditable`) is dynamically editable and must be treated as a form field — `ShowCaption = false` on such a field is also a violation.
+
+## Best Practice
+
+Leave `ShowCaption` at its default on editable fields. If a caption would be visually redundant, rely on one of the documented magic patterns (group-labeled first child, repeater column, PromptDialog prompt input) rather than removing the caption.
+
+See sample: `show-caption-on-editable-fields.good.al`.
 
 ## Anti Pattern
 
-`ToolTip = 'The name of the customer'` — missing "Specifies" opener, missing period. `ToolTip = 'Customer name'` — a fragment rather than a sentence. Both sit inconsistently next to adjacent "Specifies …" tooltips on the same page.
+The `InstructionalText` property on a field renders as HTML placeholder text and is **not** a substitute for a caption — it disappears once the user types and is not reliably announced by screen readers.
 
-See sample: `field-tooltips-start-with-specifies-and-end-with-period.bad.al`.
+See sample: `show-caption-on-editable-fields.bad.al`.
 
 
-# Respect Business Central's UI text character limits to avoid truncation
+# Standalone content in a layout-table grid
 
 ## Description
 
-Business Central UI surfaces have practical character limits before the platform truncates or the translator's localization overflows the available space. Authoring captions and tooltips close to the English limit almost guarantees truncation in languages whose translations are longer (German, French, Spanish average 20–40% longer than English). The limits are not hard compiler errors — they are product-quality thresholds that agents should flag at author time so the string reaches localization with room to grow.
+A non-editable field with `ShowCaption = false` is acceptable inside a layout-table grid **only when** the field is **standalone content** — it displays a value that is meaningful on its own (for example a status message or a description) and is **not** intended to label or be labeled by another field in the grid.
+
+Layout tables have no `<th>` column headers, so a captionless field that is meant to participate in a tabular relationship with a neighbour has no accessible label at all.
 
 ## Best Practice
 
-Author within these approximate limits (English): action and field captions ~40 chars; field-group, menu-item, page, and dialog titles ~40 chars; button captions ~20 chars; action and field tooltips ~250 chars; dialog text and error messages ~250 chars; notifications ~100 chars; checklist ShortTitleChecklist 34, LongerTitleCard 53, CardDescription 180. Leave headroom for longer translations; at 40/40 in English, German is likely to truncate.
+Reserve `ShowCaption = false` in a layout-table grid for non-editable, free-standing content cells. If a field's role is to label or annotate another field in the same grid, restructure the grid to meet the data-table conditions (see `grid-data-table-heuristic.md`) instead of hiding the caption.
+
+See sample: `standalone-content-in-layout-table.good.al`.
+
+
+# StyleExpr: Boolean toggle vs Text variable
+
+## Description
+
+`StyleExpr` on a page field serves two distinct purposes depending on its type:
+
+- **Boolean** — When `StyleExpr` is a Boolean expression, it controls whether the `Style` property is applied. In this case the `Style` property carries the style name; analyze `Style` and ignore `StyleExpr` itself.
+- **Text** — When `StyleExpr` is a Text variable (e.g. `StyleExpr = StatusStyle` where `StatusStyle: Text` and is assigned literals such as `'Favorable'`), the variable contains the style name at runtime. There may be no `Style` property at all — the `StyleExpr` variable **is** the style.
+
+When `StyleExpr` is Text, you must trace the variable's assignments — typically in `OnAfterGetRecord` or `OnAfterGetCurrRecord` — to determine which styles can be applied, then apply the same accessibility rules as for a literal `Style` value.
+
+## Best Practice
+
+Inspect the declared type of the symbol referenced by `StyleExpr` before drawing conclusions. If it is Boolean, evaluate the `Style` property. If it is Text, follow every assignment to the variable and check the full set of possible style values against `cosmetic-styles-need-no-textual-context.md` and `semantic-styles-need-independent-textual-meaning.md`.
+
+See sample: `style-expr-text-vs-boolean.good.al`.
+
+
+# Tabular intent requires data-table conditions
+
+## Description
+
+The most common accessibility bug in grid layouts is partially following the data-table conventions. A developer arranges fields with **tabular intent** — one field acts as a label or row header for another — but the grid does not satisfy all the data-table heuristic conditions. The client falls back to layout-table rendering, and the tabular relationships between fields are lost: a screen reader announces each field independently with no programmatic association.
+
+Flag a grid as an accessibility issue when any of these are true:
+
+- An editable field has `ShowCaption = false` and the grid does not meet all data-table conditions.
+- Fields are arranged so that one field is clearly intended to label or describe another field (tabular data intent), but the grid does not meet all data-table conditions.
+
+Both manifestations have the same root cause: tabular semantics were intended but the heuristic ultimately rendered the grid as a layout table.
 
 ## Anti Pattern
 
-`action(RecalculateAndReapplyAllOutstandingCustomerDiscounts) { Caption = 'Recalculate and reapply all outstanding customer discounts'; }` — 58 characters in English, essentially guaranteed to truncate once translated. The fix is to shorten the English caption (`Recalculate customer discounts`, 30 chars) and move the full sentence into the tooltip where the budget is larger.
+A single field that keeps its visible caption is enough to demote an entire would-be data-table grid into a layout table — and silently strip the labels off its sibling captionless fields. Either restructure to meet all three conditions, or restore captions on every editable field.
+
+See sample: `tabular-intent-requires-data-table-conditions.bad.al`.
 
 
-# Titles carry no trailing punctuation and no trailing ellipsis
+# Primary-key and field-type changes are safe only on tables without existing data
 
 ## Description
 
-Page titles, section titles, FastTab titles, and dialog titles in Business Central are labels, not sentences — they have no trailing period, question mark, or exclamation. Trailing ellipsis ("…" or "...") on a title is specifically a long-standing Windows convention for action buttons that open a dialog, and AL handles that via the action's runtime behaviour rather than the caption text. Adding the ellipsis literally into a page caption or action caption is wrong in both directions: the platform also displays its own ellipsis when appropriate, and the static three dots corrupt translations that adjust punctuation for the locale.
+Primary-key changes and field-type changes (for example widening `Integer` to `BigInteger`) rewrite the on-disk layout of every row in the table. On a new feature table that ships in the same change as the modification, no rows exist and the change is free. On an existing table that already holds tenant data — base-app tables, ledger entries, anything that has been live across releases — the same change can fail outright (key uniqueness violations, value overflow on conversion) or require a full table rewrite during the upgrade window. Either way, the change needs an explicit migration design, not just a metadata edit.
 
 ## Best Practice
 
-End titles with the last word of the title. Sentence case per the capitalization rule for the phrase type (see `caption-capitalization-noun-phrase-vs-sentence-phrase`). If a dialog needs "…" behaviour, rely on the platform; do not type the characters into the caption string.
+Treat primary-key and field-type changes as restricted to tables introduced in the same change. For changes on tables with existing data, design and ship the corresponding upgrade procedure (typically backed by `DataTransfer` and an upgrade tag) that guarantees the new layout is achievable for every row, and verify with concrete evidence that the existing values fit the new constraint (no PK collisions, no value-range overflow).
+
+See sample: `breaking-changes-only-on-tables-without-data.good.al`.
 
 ## Anti Pattern
 
-`Caption = 'Setup wizard...'`, `Caption = 'Sales orders.'`, `page Caption = 'Customer list:'` — all three decorate the title with terminal punctuation that is noise to the reader and a translation headache.
+Changing the primary key on a base-app table, or widening / narrowing a field type on a table that has been shipping for releases, with no accompanying upgrade plan. The change compiles cleanly and may even deploy on an empty-ish tenant, then fails on customers who actually have data.
+
+See sample: `breaking-changes-only-on-tables-without-data.bad.al`.
 
 
-# Tooltips describe what a thing is; teaching tips guide what the user can do with it
+# Use `DataTransfer` for bulk updates on large tables
 
 ## Description
 
-Business Central exposes two distinct affordances for explaining the UI: ToolTip and the AboutTitle/AboutText teaching tip. They answer different questions and are complementary, not alternatives. ToolTip answers "What is this field/action?" and is expected on every field and action. The teaching tip answers "What can I do with this page or this important element?" and is reserved for the few entry points where an onboarding hint is worth the user's attention. Authors who put teaching-tip content in tooltips make tooltips noisy; authors who put tooltip content in teaching tips make teaching tips useless.
+Tables that can contain more than 300,000 records, and any newly added field on an existing table, should be initialized with `DataTransfer` rather than a `repeat ... Modify ... until Next() = 0` loop. `DataTransfer` issues a single set-based statement to the database; the loop/modify pattern issues one round-trip per row and accumulates write locks for the duration of the upgrade. On the volumes that drive upgrade pain — ledger entries, item ledger entries, price list lines — the difference is the upgrade running for minutes instead of hours.
 
 ## Best Practice
 
-Write ToolTip as a concise descriptive sentence following the "Specifies …" or imperative voice rules. Reserve AboutTitle/AboutText for the top-level card and list pages where first-time users benefit from discovering the page's purpose and outcome. On list pages, title uses the plural form ("About sales invoices"). On card or document pages, title uses the entity name plus "details" ("About sales invoice details").
+For a bulk update use a `DataTransfer` variable: call `SetTables(Database::"...", Database::"...")` (source and destination may be the same table), add filters with `AddSourceFilter`, set the target value with `AddConstantValue` (or copy a source field with `AddFieldValue`), and execute with `CopyFields()`. To express multiple distinct updates against the same table, `Clear` the `DataTransfer` between executions and configure the next one.
+
+See sample: `datatransfer-for-bulk-init.good.al`.
 
 ## Anti Pattern
 
-A field ToolTip that tells the user "You can create new customers from here and update their payment terms, and the list also shows…" — that is teaching-tip content. Conversely, an AboutText that simply repeats the page Caption tells the user nothing they did not already read in the title bar.
+Iterating with `FindSet(true) ... repeat ... Modify() ... until Next() = 0` to set a single field across an entire large table. On 300k+ rows this is the canonical slow-upgrade footgun.
+
+See sample: `datatransfer-for-bulk-init.bad.al`.
+
+## See also
+
+- `datatransfer-skips-triggers-and-subscribers.md` — `DataTransfer` does not raise field validation triggers or event subscribers; if a row needs validation logic, `DataTransfer` is the wrong tool.
 
 
-# Tour tips describe outcomes, not instructions — never tell the user to perform an action during the tour
+# `DataTransfer` does not fire validation triggers or event subscribers
 
 ## Description
 
-A tour is a guided sequence of teaching tips that runs over the page while the user is passively watching. The tour framework does not expose the page's actions during the tip — so an `AboutText` that tells the user `Enter the customer name here.` or `Now post the invoice.` asks the user to do something that is not possible in the moment. The result is a confusing first-run experience. Tour content should describe what the element represents and what the user will be able to do with it after the tour completes, in descriptive rather than imperative voice.
+`DataTransfer` writes directly at the database layer. It does not invoke field `OnValidate` triggers, table `OnModify` triggers, or any `OnAfterModifyEvent` / `OnBeforeValidate...` event subscribers that a normal `Record.Modify(true)` would. This is precisely what makes it fast — and precisely what makes it a footgun when the field being updated has validation logic that other code relies on. The receiving code never gets the signal that a row changed, derived fields stay stale, audit hooks do not run.
+
+For *new fields and tables added in the same change* this is fine: nothing yet depends on the validation. For *pre-existing fields with validation logic*, `DataTransfer` quietly bypasses business logic that may be load-bearing for posting, calculation, or integration scenarios.
 
 ## Best Practice
 
-Write tour AboutTitle as a short noun-phrase label for the element ("Who you are selling to", "When all is set, you post"). Write AboutText as one or two sentences that describe the outcome or meaning, not steps. Keep the tour itself short — one to four tips total — and let the regular ToolTip carry the per-element detail.
+Use `DataTransfer` only when the field or table is new in the same change — initial population is the canonical safe case. When updating a pre-existing field that has validation logic, either use `Modify(true)` to honour the triggers, or, if `DataTransfer` is still required for performance reasons, leave a comment that explicitly states "validation triggers and event subscribers are intentionally not raised" and verify with the field's owner that this is safe.
+
+See sample: `datatransfer-skips-triggers-and-subscribers.good.al`.
 
 ## Anti Pattern
 
-`AboutText = 'Enter the customer name here.'` on a tour tip — the action is not active. `AboutText = 'Now post the invoice.'` during a tour — the user cannot, and would not want to mid-tour. Both teach nothing and confuse the reader.
+Reaching for `DataTransfer` to update an existing field with non-trivial `OnValidate` logic, without a comment and without confirming that subscribers can be skipped. The upgrade succeeds; runtime behaviour drifts silently.
+
+See sample: `datatransfer-skips-triggers-and-subscribers.bad.al`.
 
 
-# Write "and" in UI captions; keep the ampersand only as an accelerator-key prefix
+# Log telemetry; do not raise errors that block the upgrade
 
 ## Description
 
-AL Caption strings use the ampersand character in two distinct ways. Inside a caption, `&` is the accelerator-key prefix — `Caption = '&Post'` underlines the P and makes Alt+P activate the action. Outside that role, `&` is sometimes used as a shortening for the word "and" (`Post & Send`). The first usage is platform-defined and must be preserved. The second is a style choice that the Business Central voice guidelines reject: `Post and send` reads naturally in all supported locales and translates cleanly, while `Post & Send` conveys nothing extra and adds a character that localizers have to re-evaluate.
+When upgrade code encounters unexpected data — a record it expected to find, a relationship it assumed to be intact — the response is to log telemetry and continue, not to raise an error. A runtime error inside an upgrade codeunit aborts the upgrade for the company or database, leaving the customer stuck on the old version. Customers should not be blocked from upgrading because of a data inconsistency that an upgrade routine could not have anticipated.
 
 ## Best Practice
 
-Use the word "and" in caption text. Keep `&` only when it is immediately followed by a letter chosen as the keyboard accelerator. If both meanings apply, write them explicitly: `Post and &send` uses `s` as the accelerator and spells the conjunction out.
+When an upgrade procedure detects something missing, call `Session.LogMessage` with a stable event ID, classify the message verbosity (typically `Warning`), and `exit` the procedure so the rest of the upgrade can proceed. The platform telemetry then surfaces the situation to the partner without breaking the customer.
 
-See sample: `use-and-not-ampersand-in-ui-captions.good.al`.
+See sample: `do-not-block-upgrade-on-data-errors.good.al`.
 
 ## Anti Pattern
 
-`Caption = 'Post & Send'` as the full caption — the ampersand is meant as "and" but the AL parser cannot tell, and the result is inconsistent with every other "X and Y" caption in the product.
+Calling `Record.Get(Key)` (or any other erroring API) and letting the error propagate out of the upgrade trigger. The first tenant with imperfect data fails to upgrade, and the failure surfaces as a hard upgrade error rather than as a telemetry signal.
 
-See sample: `use-and-not-ampersand-in-ui-captions.bad.al`.
+See sample: `do-not-block-upgrade-on-data-errors.bad.al`.
 
 
-# Call named methods from OnUpgrade triggers; keep the triggers empty of logic
+# Add new enum values only at the end
 
 ## Description
 
-An upgrade codeunit (`Subtype = Upgrade`) runs its triggers once per upgrade scope. Inlining upgrade logic inside the trigger body mixes the entry point with the work, makes individual steps untestable in isolation, and prevents the standard upgrade-tag guard pattern from being applied cleanly. The convention across Business Central's own upgrade codeunits is that `OnUpgradePerCompany` and `OnUpgradePerDatabase` are a list of calls to named local procedures, each implementing one step behind its own upgrade-tag check.
+An AL `enum` is a fixed list of ordinal-named values. Persisted rows reference enum members by ordinal, not by name. The only enum mutation that preserves the meaning of every existing row is **appending a new value at the end** — every previously valid ordinal still maps to the same member. Inserting a new value in the middle, renumbering existing values, or removing a value without obsoletion all shift ordinals: rows written with the old layout silently take on the new member at their saved ordinal.
 
 ## Best Practice
 
-Keep `OnUpgradePerCompany` and `OnUpgradePerDatabase` to a list of `UpgradeXxx();` statements. Put every data migration, default, or correction in a named local procedure whose first action is the upgrade-tag guard. Empty trigger bodies are also acceptable as placeholders on a new codeunit with no current steps.
+When adding an enum value, place it after the last existing `value(N; ...)` entry, with an ordinal strictly greater than every existing one. Never renumber existing entries. To retire a value, do not delete it: mark it `ObsoleteState = Pending` (and later `Removed`) with `ObsoleteReason` and `ObsoleteTag` so the ordinal remains taken.
 
-See sample: `call-methods-from-onupgrade-triggers-not-inline-code.good.al`.
+See sample: `enum-values-additive-at-end.good.al`.
 
 ## Anti Pattern
 
-Writing `Customer.ModifyAll(...)`, `TableX.SetRange(...)` + loops, or `DataTransfer.CopyFields()` directly inside the trigger body. The step is untagged, untestable, and re-runs on every upgrade.
+Inserting a value between existing entries ("just put `NewMiddleValue` between `First` and `Second`"), or removing a value from the enum without first going through `ObsoleteState = Pending` → `Removed`. Every row whose persisted ordinal matched the removed or shifted value now reads as a different member.
 
-See sample: `call-methods-from-onupgrade-triggers-not-inline-code.bad.al`.
+See sample: `enum-values-additive-at-end.bad.al`.
+
+## See also
+
+- `obsoletion-requires-reason-and-tag.md` — how to retire an enum member correctly.
+- `obsolete-pending-to-removed-staging.md` — the `Pending → Removed` lifecycle.
 
 
-# Detect first install via DataVersion equal to 0.0.0.0 in OnInstall triggers
+# Detect first install with `DataVersion() = Version.Create('0.0.0.0')`
 
 ## Description
 
-`OnInstallAppPerCompany` fires on first install and on subsequent re-installs after an uninstall. Code that should only run on the very first install needs to distinguish the two — and the supported way is checking `AppInfo.DataVersion() = Version.Create('0.0.0.0')`, which is the sentinel for "no prior data exists for this app in this tenant". This is the one case where a DataVersion check is correct; steady-state upgrade steps should use upgrade tags instead.
+On the first install of an extension on a tenant the platform records a zero data version: `AppInfo.DataVersion()` returns `Version.Create('0.0.0.0')`. Subsequent upgrades record the actual previous version. The `OnInstallAppPerCompany` trigger uses this distinction to detect a brand-new install — for example, to seed default rows that should not be re-inserted on a normal upgrade. This is the one place where reading `DataVersion()` is the right tool; for everything else, use an upgrade tag.
 
 ## Best Practice
 
-In `OnInstallAppPerCompany`, call `NavApp.GetCurrentModuleInfo(AppInfo)` and exit early when `AppInfo.DataVersion()` is non-zero. The remainder of the trigger body then runs exclusively on first install. For all other version-sensitive upgrade logic, use upgrade tags (see `use-upgrade-tags-not-version-checks`).
+In `OnInstallAppPerCompany`, fetch the current `ModuleInfo` via `NavApp.GetCurrentModuleInfo`, compare `AppInfo.DataVersion()` to `Version.Create('0.0.0.0')`, and run install-only seed logic only when they match. On any non-zero data version, exit immediately — that path is an upgrade, not an install.
 
-See sample: `detect-first-install-via-dataversion-zero.good.al`.
+See sample: `first-install-dataversion-zero-check.good.al`.
 
 ## Anti Pattern
 
-Running initialization unconditionally in `OnInstallAppPerCompany` and relying on primary-key collisions to avoid double-inserts. Re-install scenarios either throw or overwrite existing rows; the install path becomes brittle as the app grows.
+Treating `OnInstallAppPerCompany` as if it always implies "fresh tenant". The trigger also fires when reinstalling over an existing data set; without the `0.0.0.0` guard, install-only seed code re-runs on every upgrade and duplicates rows.
 
-See sample: `detect-first-install-via-dataversion-zero.bad.al`.
+See sample: `first-install-dataversion-zero-check.bad.al`.
+
+## See also
+
+- `use-upgrade-tags-not-version-checks.md` — for upgrade steps after first install, use upgrade tags rather than `DataVersion`.
 
 
-# Do not make external service calls inside upgrade codeunits
+# Guard every database read in upgrade code with `if`
 
 ## Description
 
-The upgrade scope has to complete for the tenant to reach the new version. Any call in the upgrade path that depends on an external service — HttpClient to a partner API, a DotNet interop call, a codeunit that fetches remote configuration — fails closed when the service is unreachable, misconfigured, or slow. The failure blocks the upgrade for every customer whose environment cannot reach the dependency at the moment the upgrade runs, and there is no user present to retry. The scope is specifically code inside codeunits with `Subtype = Upgrade` or reachable from their triggers.
+Inside an upgrade codeunit (or any procedure transitively invoked from `OnUpgradePerCompany` / `OnUpgradePerDatabase`), an unguarded `Record.Get`, `Record.FindSet`, or `Record.FindLast` raises a runtime error when the row or set is missing. In upgrade context that error aborts the entire upgrade for the company or database — a far worse outcome than the missing data itself. Records the upgrade reasons about may legitimately not exist on every customer's tenant.
 
 ## Best Practice
 
-Defer external calls to runtime code that executes after the upgrade — install-triggered tasks, background job queue entries scheduled by the upgrade, or lazy initialization on first use. The upgrade step should compute a local result or mark work to be done, not perform the remote call itself.
+Wrap every read in an `if`. `if Item.Get(No) then ...`, `if Customer.FindSet() then;`, `if not Vendor.FindLast() then exit;`. The empty-then form `if Customer.FindSet() then;` is the idiomatic way to attempt a read whose only purpose is to position a record, while swallowing the "not found" case.
+
+See sample: `guard-database-reads.good.al`.
 
 ## Anti Pattern
 
-`HttpClient.Get(...)` or `DotNetType.CallStaticMethod(...)` directly in `OnUpgradePerCompany`, or in a local procedure called from it. The upgrade now depends on network availability to a service the platform does not control.
+Calling `Item.Get()`, `Customer.FindSet()`, or `Vendor.FindLast()` bare in upgrade code. The first tenant whose data does not match the upgrade's assumptions will fail to upgrade.
+
+See sample: `guard-database-reads.bad.al`.
 
 
-# Enum changes must be additive at the end; never insert or remove values
+# Hybrid migration codeunits are not standard upgrade codeunits
 
 ## Description
 
-AL enums store their ordinal on disk. Inserting a new value in the middle of an existing enum shifts every following ordinal by one: every row whose field holds the old ordinal N now resolves to the value that used to be N+1. Removing a value without obsoletion has the same effect. Both changes are data corruption disguised as a code edit and are effectively irreversible once a tenant has upgraded. Adding values at the end is safe — existing ordinals keep their meaning.
+Codeunits like `HybridBC14`, `HybridSL`, `HybridGP`, and `HybridBaseDeployment` implement one-time migration paths from a specific source system into Business Central. They run in a different pipeline from the standard per-company / per-database upgrade triggers and follow patterns shaped by that source — staging tables, schema-mapped imports, and per-source post-processing. The rules that apply to standard upgrade codeunits — guarded reads, no external calls, `DataTransfer` for bulk init, `Subtype = Upgrade`, upgrade tags — are not the right yardstick for these migration codeunits.
 
 ## Best Practice
 
-Append new enum values at the end, taking the next free ordinal. Renaming the caption on an existing ordinal is fine.
+Treat a hybrid migration codeunit as a domain of its own. If you need to add or modify migration logic, follow the conventions of the surrounding hybrid migration codebase (which has its own dispatcher, its own way of recording progress, and its own error handling) rather than imposing standard upgrade conventions on it. Conversely, do not borrow hybrid-migration patterns into standard upgrade codeunits — the platform contract is different.
 
-When a value must be retired, follow the two-stage obsoletion workflow:
-
-1. **First release:** Mark the value with `ObsoleteState = Pending`, `ObsoleteReason`, and `ObsoleteTag`. This gives callers at least one release cycle to migrate.
-2. **Later release:** Advance to `ObsoleteState = Removed` once all callers have been updated.
-
-Never skip straight to `ObsoleteState = Removed` without first going through `Pending` — doing so removes the warning cycle that callers depend on. Do not reclaim the ordinal in either stage. See also: `use-obsolete-pending-before-removed.md`.
-
-See sample: `enum-changes-must-be-additive-at-the-end.good.al`.
+When reviewing changes inside a hybrid migration codeunit, do not flag missing upgrade tags, missing `Subtype = Upgrade`, or missing `OnUpgradePerCompany` wiring. None of those apply.
 
 ## Anti Pattern
 
-Inserting `value(1; "NewMiddleValue")` between existing `value(0; "First")` and the original `value(1; "Second")`. Every row that stored ordinal 1 before the change now reads as `NewMiddleValue`. The same applies to removing a value outright without obsoletion.
-
-See sample: `enum-changes-must-be-additive-at-the-end.bad.al`.
+Reviewing a change inside `HybridBC14` / `HybridSL` / `HybridGP` / `HybridBaseDeployment` against standard upgrade rules and flagging the absence of `Subtype = Upgrade` or upgrade-tag plumbing.
 
 
-# Guard every database read in upgrade codeunits; never let a missing row block the upgrade
+# `InitValue` does not back-fill existing rows
 
 ## Description
 
-An unguarded `Record.Get()` raises when the row does not exist; an unguarded `FindSet()` or `FindLast()` raises when the result set is empty. In ordinary runtime code those errors surface to a user who can retry. In an upgrade codeunit they abort the upgrade of the tenant and the customer is blocked from getting to the new version. Real-world data is inconsistent enough — missing lookup rows, empty setup tables, skipped modules — that an unguarded read reliably blocks at least one customer per release.
+`InitValue` on a field defines the value the platform assigns when a *new* record is inserted. It does not touch rows that already exist when the field is added. When a new field is added to an existing table — directly or via a table extension — every pre-existing row receives the datatype default (`false` for Boolean, `0` for numeric, empty for text), not the `InitValue`. If the intended semantics require existing rows to carry the `InitValue`, the change is incomplete without an upgrade routine that sets the field on those rows.
+
+Several legitimate cases do NOT need upgrade code:
+- New fields on brand-new tables (no existing rows).
+- New `Boolean` fields without `InitValue` where the datatype default `false` is the intended value.
+- New fields on configuration / setup tables that have no meaningful "existing data".
+- Informational or optional fields (logging, preferences, tracking) where `false` / empty is a valid state.
 
 ## Best Practice
 
-Wrap every Get, FindSet, FindFirst, FindLast, and related call in an `if … then` guard. On the not-found path, either exit the current step or log telemetry and continue; never let the upgrade scope raise. `if Customer.FindSet() then;` (statement terminator as the entire body) is an acceptable pattern when only the side effect of positioning matters.
+When a new field on an existing table has an `InitValue` that matters, ship an upgrade procedure that walks the existing rows and sets the field to the same value — typically via `DataTransfer.AddConstantValue` for performance — guarded by an upgrade tag.
 
-See sample: `guard-every-database-read-in-upgrade-codeunits.good.al`.
+See sample: `initvalue-does-not-update-existing-rows.good.al`.
 
 ## Anti Pattern
 
-`Customer.Get(CustomerNo);` or `SalesHeader.FindLast();` inside an upgrade procedure. One missing row in one tenant turns every future upgrade into a support ticket.
+Adding a field with `InitValue = true;` (or any non-default `InitValue`) and shipping no upgrade code. Existing rows silently carry the datatype default, leaving the table in two states: rows created before the upgrade with the wrong value, and rows created after with the right one.
 
-See sample: `guard-every-database-read-in-upgrade-codeunits.bad.al`.
+See sample: `initvalue-does-not-update-existing-rows.bad.al`.
 
 
-# InitValue on a new field does not populate existing rows
+# Performance-impacting upgrade triggers need justification and skip logic
 
 ## Description
 
-The `InitValue` property sets a field's default for rows created after the field exists. Rows that already exist when the field is added keep the data-type default (empty text, zero, false, epoch date) — InitValue does not retroactively apply. Shipping a new field with `InitValue = true` on an existing table produces a silently inconsistent dataset: new rows match the intended default, existing rows do not, and callers that do not distinguish the two read the wrong state for existing data.
+Triggers such as `OnValidateUpgradePerCompany` run on every upgrade pass. When their body performs non-trivial work — full-table scans, cross-table validations — the cost is paid on every upgrade of every tenant, even when there is nothing to validate. That cost is acceptable only when the validation is critical (regulatory compliance, data-integrity guarantees the platform depends on) AND the trigger short-circuits once it has done its work.
 
 ## Best Practice
 
-When adding a field to an existing table with a meaningful default, write an upgrade step that populates existing rows with the same value, guarded by its own upgrade tag. Use `DataTransfer` with `AddConstantValue` for set-based initialization (see `use-datatransfer-for-large-dataset-initialization`). Exceptions: brand-new tables, new Boolean fields where `false` is the correct value for existing rows, and informational fields where empty is an acceptable state.
+A performance-impacting upgrade trigger carries two things: a written comment that names the reason the work has to happen on every upgrade pass, and an early-exit guard backed by an upgrade tag so the work runs at most once per tenant. The `HasUpgradeTag` check at the top exits when the validation has already been recorded; the `SetUpgradeTag` call at the bottom records completion.
 
-See sample: `initvalue-does-not-populate-existing-records.good.al`.
+See sample: `minimize-onvalidate-upgrade-triggers.good.al`.
 
 ## Anti Pattern
 
-Adding `field(100; "Is Active"; Boolean) { InitValue = true; }` to an existing business table without upgrade code. New records are Active; every existing record is silently inactive. The bug surfaces later as "why is this data missing from the default report?"
+Doing real work in `OnValidateUpgradePerCompany` with no upgrade-tag guard. The same scan runs every upgrade, multiplying upgrade time by the number of releases the customer takes.
 
-See sample: `initvalue-does-not-populate-existing-records.bad.al`.
+See sample: `minimize-onvalidate-upgrade-triggers.bad.al`.
 
 
-# Register every upgrade tag with the matching PerCompany or PerDatabase subscriber
+# No external calls inside upgrade codeunits
 
 ## Description
 
-An upgrade tag set via `UpgradeTag.SetUpgradeTag` only participates in the platform's upgrade-tag machinery when it is also registered through `OnGetPerCompanyUpgradeTags` or `OnGetPerDatabaseUpgradeTags` event subscribers on `Codeunit "Upgrade Tag"`. Without registration, the platform cannot enumerate the tag for diagnostic reporting, skipped-step detection, or cross-app coordination. The step still runs and sets the tag, but the tag is effectively invisible to the rest of the upgrade infrastructure.
+Upgrade code runs in a constrained execution window: the tenant is mid-upgrade, no users are signed in, and a failure aborts the entire transaction. An external HTTP call, DotNet interop call, or any other I/O to a system outside Business Central can hang or fail for reasons completely unrelated to the upgrade — DNS, expired credentials, a service that is itself being upgraded — and the upgrade fails with it. Rolling back from such a failure is hard because the upgrade pipeline assumes its work is deterministic.
+
+The rule applies inside any codeunit with `Subtype = Upgrade` and to any procedure transitively invoked from `OnUpgrade...` triggers. The same calls in regular runtime code — pages, table triggers, normal codeunits, background jobs — are fine.
 
 ## Best Practice
 
-For every upgrade-tag constant referenced in `HasUpgradeTag`/`SetUpgradeTag`, register it in the subscriber that matches its trigger scope: tags used from `OnUpgradePerCompany` go in `OnGetPerCompanyUpgradeTags`; tags used from `OnUpgradePerDatabase` go in `OnGetPerDatabaseUpgradeTags`. Keep the tag string in a single source (Label or function) and reference it at the guard, the setter, and the registration.
+Defer external calls to runtime code. If a piece of upgrade work conceptually needs data from an external service, set a flag or write a queue row during upgrade and have the runtime code make the call later (for example on first user sign-in or via job queue), where retries and degraded modes are tractable.
+
+See sample: `no-external-calls-in-upgrade.good.al`.
+
+## Anti Pattern
+
+Calling `HttpClient.Get`, `HttpClient.Post`, or DotNet interop methods from `OnUpgradePerCompany`, `OnUpgradePerDatabase`, or any procedure they invoke.
+
+See sample: `no-external-calls-in-upgrade.bad.al`.
+
+
+# Stage obsoletion `Pending → Removed`; write upgrade code on removal
+
+## Description
+
+`ObsoleteState` has a deliberate two-step lifecycle. `Pending` keeps the element compilable and present — callers still find it but receive a deprecation warning. `Removed` marks the element as gone from the contract; the body may be empty or wrapped in `#if not CLEAN<version>` so the symbol survives only for binary compatibility. Upgrade code that migrates persisted data away from the obsolete element is normally written when the element moves to `Removed`, not when it goes `Pending`. `ObsoleteState = Pending` without accompanying upgrade code is the expected steady state during the deprecation window; reviewers should not flag that combination as missing migration.
+
+## Best Practice
+
+Stage the deprecation across releases. Step 1: mark `Pending` with reason and tag; consumers are warned but data and code keep working. Step 2: in a later release, transition to `Removed` and (if persisted data references the element) ship an upgrade procedure that migrates that data — gated by an upgrade tag. The standard mechanic for retiring the actual implementation body is to remove the `#if not CLEAN<version>` block in the same release that flips the state to `Removed`.
+
+See sample: `obsolete-pending-to-removed-staging.good.al`.
+
+## Anti Pattern
+
+Jumping straight to `ObsoleteState = Removed` without a prior `Pending` release. Consumers have no deprecation window to migrate and any data still referencing the element is stranded. Equally wrong: leaving an element `Pending` indefinitely and never staging its removal — the deprecation never completes.
+
+See sample: `obsolete-pending-to-removed-staging.bad.al`.
+
+
+# Mark obsolete elements with `ObsoleteState`, `ObsoleteReason`, and `ObsoleteTag`
+
+## Description
+
+When a procedure, field, table, page, or enum value is being retired, AL requires three pieces of metadata to declare the deprecation:
+
+- `ObsoleteState` — `Pending` while the element still exists but is being phased out, `Removed` once it should no longer be used.
+- `ObsoleteReason` — a short human-readable string explaining what to use instead. Tooling and downstream consumers surface this when warning callers.
+- `ObsoleteTag` — a stable version-like marker (typically the release version in which the deprecation was introduced, e.g. `'22.0'`).
+
+Omitting `ObsoleteReason` or `ObsoleteTag` leaves consumers with `ObsoleteState = Pending` but no guidance and no traceability. Declaring `ObsoleteState = Removed` without a reason or tag is the same failure with a stronger blast radius.
+
+## Best Practice
+
+Every obsoleted element carries all three properties together. The reason names the replacement explicitly; the tag is the version in which the deprecation was introduced and stays stable for the life of the deprecation.
+
+See sample: `obsoletion-requires-reason-and-tag.good.al`.
+
+## Anti Pattern
+
+Setting only `ObsoleteState = Pending;` (or `Removed`) without `ObsoleteReason` and `ObsoleteTag`. Callers see a warning with no explanation, and the deprecation cannot be tracked by version.
+
+See sample: `obsoletion-requires-reason-and-tag.bad.al`.
+
+## See also
+
+- `obsolete-pending-to-removed-staging.md` — when to advance `Pending` to `Removed` and write upgrade code.
+
+
+# Register every upgrade tag with the platform via an event subscriber
+
+## Description
+
+The `Upgrade Tag` codeunit only recognizes a tag if the tag was published to the platform through one of two events on that codeunit: `OnGetPerCompanyUpgradeTags` for tags set inside `OnUpgradePerCompany`, and `OnGetPerDatabaseUpgradeTags` for tags set inside `OnUpgradePerDatabase`. A tag that is `Set` and `Has`-checked in code but never added to one of these lists is unknown to the platform — its semantics around skip-on-reinstall, telemetry, and operator queries do not apply.
+
+The registration scope must match where the tag is set: a tag used from `OnUpgradePerCompany` registers in `OnGetPerCompanyUpgradeTags`; a tag used from `OnUpgradePerDatabase` registers in `OnGetPerDatabaseUpgradeTags`. Crossing the scopes silently breaks the tag.
+
+## Best Practice
+
+For every new upgrade tag, add one line to the matching subscriber: `PerCompanyUpgradeTags.Add(MyUpgradeTag());` or `PerDatabaseUpgradeTags.Add(MyUpgradeTag());`. Place the subscribers in the same codeunit (or a dedicated "Upgrade Tag Definitions" codeunit) so the tag string and its registration stay together.
 
 See sample: `register-upgrade-tags-with-subscribers.good.al`.
 
 ## Anti Pattern
 
-Adding a new `UpgradeTag.SetUpgradeTag(MyTag())` without the matching `PerCompanyUpgradeTags.Add(MyTag())` in the registration subscriber. The code compiles and the step completes, but the tag is unregistered and the infrastructure is partially disabled.
+Calling `UpgradeTag.SetUpgradeTag(MyUpgradeTag())` without ever adding `MyUpgradeTag()` to the corresponding `OnGetPerCompany...` / `OnGetPerDatabase...` subscriber.
 
 See sample: `register-upgrade-tags-with-subscribers.bad.al`.
 
 
-# Skip non-essential initialization when ExecutionContext is Upgrade
+# Skip non-essential runtime work when `GetExecutionContext() = ExecutionContext::Upgrade`
 
 ## Description
 
-Initialization code that inserts default rows — report selections, number-series, setup-table defaults — is correct on first install and harmful during upgrade. Existing tenants already have these rows, possibly customized; re-running the initialization either fails on primary-key conflicts or silently overwrites customer configuration. The platform exposes `GetExecutionContext()` so the same procedure can be safely called from install and upgrade paths without duplicating the insert logic.
+Runtime procedures (table triggers, install routines, helpers called from many places) sometimes fire during the upgrade window because the upgrade itself touches the data they react to. When the work those procedures do is not strictly required for the upgrade to succeed — inserting report-selection entries, seeding optional configuration, sending welcome notifications — they should detect upgrade context with `GetExecutionContext() = ExecutionContext::Upgrade` and exit. This keeps upgrade transactions tight and avoids side effects that the upgrade pipeline did not ask for.
+
+This is the opposite of a load-bearing concern: code that MUST run during the upgrade does not consult execution context. The check is for *optional* side effects that happen to be wired into runtime code paths.
 
 ## Best Practice
 
-Check `if GetExecutionContext() = ExecutionContext::Upgrade then exit;` at the top of idempotent-on-install-only procedures. Keep the early exit narrow and document the reason. The check should be additive to existing guards, not a replacement for proper primary-key handling in the insert itself.
+In a runtime procedure that performs non-essential side effects, guard the side-effect block with `if GetExecutionContext() = ExecutionContext::Upgrade then exit;` and include a brief comment explaining what is being skipped and why.
 
-See sample: `skip-non-essential-work-during-upgrade-context.good.al`.
+See sample: `skip-nonessential-work-via-execution-context.good.al`.
 
 ## Anti Pattern
 
-A procedure that unconditionally inserts a default report-selection, number-series, or setup row, called from both install and upgrade paths. On upgrade it either throws on the conflicting key or overwrites the tenant's existing configuration.
+Using `GetExecutionContext()` to *enable* upgrade behaviour from outside an upgrade codeunit. Upgrade behaviour belongs in a codeunit with `Subtype = Upgrade`; runtime code should only use the check to *suppress* optional work.
 
-See sample: `skip-non-essential-work-during-upgrade-context.bad.al`.
+See sample: `skip-nonessential-work-via-execution-context.bad.al`.
 
 
-# Use DataTransfer to initialize large tables in upgrade; not FindSet plus Modify
+# `OnUpgradePerCompany` / `OnUpgradePerDatabase` should call helpers, not inline logic
 
 ## Description
 
-An upgrade that populates a new field on millions of existing rows with a FindSet+Modify loop pays a round-trip and a per-row trigger invocation for every row — turning a multi-hour upgrade into a multi-day one on ledger-entry-scale tables. `DataTransfer` pushes the update to SQL as a single set-based operation using source filters and constant values, which is the supported platform mechanism for this scenario. The tradeoff: DataTransfer bypasses validation triggers and event subscribers — if the step depends on trigger logic, that has to be reconstructed explicitly.
+The `OnUpgradePerCompany` and `OnUpgradePerDatabase` triggers on an upgrade codeunit are dispatch points, not implementation slots. They should contain only calls to named local procedures — one call per feature being upgraded. Putting `ModifyAll`, record loops, or any business logic directly inside the trigger body makes the upgrade impossible to read, impossible to selectively skip via upgrade tags per feature, and impossible to extend without touching the trigger itself.
+
+Empty `OnUpgradePerCompany` / `OnUpgradePerDatabase` triggers are acceptable — they may be placeholders for future use or artifacts from cleanup.
 
 ## Best Practice
 
-Use DataTransfer when initializing a new field on an existing table that **can contain more than 300,000 records**, or whenever a new field is added to an existing table and the initialization must run across all existing rows. Tables in the ledger-entry and document-line category reliably exceed this threshold; treat them as requiring DataTransfer by default.
+Each upgrade trigger contains an ordered list of procedure calls, one per feature: `UpgradeFeatureA();` `UpgradeFeatureB();`. Each procedure handles its own upgrade tag, its own data work, and can be added or removed independently.
 
-Set tables, add source filters, add constant values, call CopyFields, clear, and repeat for additional slices. When trigger or subscriber behaviour is required, do that work separately against a filtered result set so the bulk update remains set-based.
-
-See sample: `use-datatransfer-for-large-dataset-initialization.good.al`.
+See sample: `triggers-call-helpers-not-implementations.good.al`.
 
 ## Anti Pattern
 
-`FindSet(true)` + `Modify()` in a loop as the initialization path for a new field across an entire existing table. The resulting upgrade time is proportional to the row count; for a ten-million-row ledger-entry table it is the single largest step in the release.
+Implementing record loops, `ModifyAll`, or other data work directly in the trigger body. The trigger then mixes orchestration with implementation, and adding a second feature requires editing the trigger rather than appending one line.
 
-See sample: `use-datatransfer-for-large-dataset-initialization.bad.al`.
+See sample: `triggers-call-helpers-not-implementations.bad.al`.
 
 
-# Deprecate via ObsoleteState Pending first; move to Removed only after the grace window
+# Upgrade logic must live in a codeunit with `Subtype = Upgrade`
 
 ## Description
 
-AL's obsolete workflow is two-stage by design. `ObsoleteState = Pending` keeps the object or member compilable and callable but emits warnings and records the deprecation in metadata. `ObsoleteState = Removed` makes it a compile error for callers. Jumping straight to Removed — or marking Pending without `ObsoleteReason` and `ObsoleteTag` — breaks dependents who had no signal to migrate, and loses the tooling's ability to surface the planned removal in sandbox builds before the production tenant upgrades.
+A codeunit only participates in the upgrade pipeline when it sets `Subtype = Upgrade`. The platform then dispatches the `OnUpgradePerCompany` and `OnUpgradePerDatabase` triggers on that codeunit during upgrade. A codeunit without `Subtype = Upgrade` — even one that declares an `OnUpgradePerCompany` trigger — is not an upgrade codeunit, and reviewers ignore it for upgrade concerns. Conversely, any procedure invoked transitively from an `OnUpgrade...` trigger of an upgrade codeunit IS upgrade code regardless of where it lives, and the upgrade rules apply to it.
 
 ## Best Practice
 
-Mark the element `ObsoleteState = Pending` with a concrete `ObsoleteReason` naming the replacement and an `ObsoleteTag` identifying the version the deprecation started. Keep it Pending through at least one major release so dependents have a cycle to migrate. Move to `ObsoleteState = Removed` only in a later release, with the same Reason and Tag retained or updated.
+Place every piece of upgrade logic in a codeunit declared with `Subtype = Upgrade;` and expose entry points via the two triggers `OnUpgradePerCompany` and `OnUpgradePerDatabase`. Helper procedures may live in normal codeunits, but they inherit the upgrade-context rules (guarded reads, no external calls, upgrade tags, etc.) when called from an upgrade trigger.
 
-See sample: `use-obsolete-pending-before-removed.good.al`.
+See sample: `upgrade-codeunit-subtype.good.al`.
 
 ## Anti Pattern
 
-`[Obsolete('', '')]` or `ObsoleteState = Removed` applied directly on an element that was public and callable in the previous release, with no preceding Pending phase. Dependents get a hard compile error with no migration signal in the previous version.
+Putting upgrade-style logic in a regular codeunit that the platform never invokes during upgrade — for example a normal codeunit with a manually invented "RunUpgrade" procedure that nothing wires to the upgrade pipeline. The migration code will simply not run.
 
-See sample: `use-obsolete-pending-before-removed.bad.al`.
+See sample: `upgrade-codeunit-subtype.bad.al`.
 
 
-# Guard upgrade steps with upgrade tags, not version checks
+# Control upgrade execution with upgrade tags, not version checks
 
 ## Description
 
-`DataVersion()` comparisons tie an upgrade step to a specific release cadence: if the step is skipped or fails on one version and the tenant upgrades past the check before the step succeeds, the step never runs. Upgrade tags, managed by `Codeunit "Upgrade Tag"`, record per-step completion in the tenant database. A tag-guarded step runs once, retries cleanly after failure, and remains idempotent across future versions regardless of the version the customer is upgrading from.
+Each piece of upgrade logic must run exactly once per company (or database) across the lifetime of an extension. The platform mechanism for that is the `Upgrade Tag` codeunit: a procedure asks `HasUpgradeTag(MyTag())` at entry, performs its work, then calls `SetUpgradeTag(MyTag())` to record completion. Subsequent upgrades on the same tenant see the tag and skip the work. Hand-rolled `if MyApp.DataVersion().Major < N then ...` chains are the wrong tool: they are version-coupled, accumulate stale branches over time, and break when a tenant skips a version.
 
 ## Best Practice
 
-Guard each step with `if UpgradeTag.HasUpgradeTag(MyTag()) then exit;` at the top of the procedure. After the step completes, call `UpgradeTag.SetUpgradeTag(MyTag())`. Define the tag string in a `Tok`-suffixed Label or returning function so the same constant is referenced at both the guard and the registration (see `register-upgrade-tags-with-getpercompany-getperdatabase-subscribers`).
+Every upgrade procedure starts with a `HasUpgradeTag` guard and ends with `SetUpgradeTag` once the work is committed. Each feature gets its own tag string so features can be re-run independently if needed.
 
 See sample: `use-upgrade-tags-not-version-checks.good.al`.
 
 ## Anti Pattern
 
-`if MyApp.DataVersion().Major < 18 then UpgradeFeatureA();` — the step runs on every upgrade from a pre-18 version, may fail on partial data, and the next retry re-runs work that already succeeded. Nesting version-check branches (`< 14` → step A, `< 17` → step B) compounds the fragility.
+Branching on `MyApp.DataVersion().Major > N`, or chains of `< N` / `< M` to decide which upgrade step to run. Such code becomes unmaintainable after a few releases and silently does the wrong thing on tenants that skip versions.
 
 See sample: `use-upgrade-tags-not-version-checks.bad.al`.
+
+## See also
+
+- `first-install-dataversion-zero-check.md` — the one situation where reading `DataVersion()` is the right call.
+- `register-upgrade-tags-with-subscribers.md` — how to make a tag known to the platform.
 
 
 # AL code review
 
 Reviews AL source changes by composing the leaf AL review skills. This is the canonical reference implementation of a **super-skill** — skill authors writing composed reviews should copy its structure.
 
-`al-code-review` does not evaluate knowledge files directly. It invokes each of its sub-skills against the same task input, collects their findings-reports, and returns a rolled-up findings-report.
+`al-code-review` does not evaluate knowledge files directly. It invokes each of its sub-skills against the same task input, collects their findings-reports, and then performs its own **self-review pass** over the diff using the agent's built-in BC and AL knowledge. BCQuality knowledge is an additive layer: anything the sub-skills found is cited from BCQuality, and anything the agent finds on its own is validated against BCQuality (cited if matched, suppressed if contradicted, surfaced as an **agent finding** otherwise). The result is a single rolled-up findings-report that mixes knowledge-backed and agent findings, each clearly tagged via `from-sub-skill`.
 
 An orchestrator invokes this skill with either a `pr-diff` (the standard PR-review entry point) or a `file-path` (single-file review). The skill produces a single JSON document conforming to the DO output contract, extended with `sub-results` and — when applicable — `skipped-sub-skills`.
 
@@ -1897,14 +2643,58 @@ The worklist is the list of sub-skills judged relevant by the previous step. Eve
 
 ## Action
 
-For each sub-skill in the worklist:
+### Execution discipline (mandatory)
+
+The Action step is a sequence of **discrete iterations**, not one combined generation. The contract requires the super-skill to invoke each sub-skill in turn and then perform a self-review pass. Concretely this means:
+
+- Treat each sub-skill in the worklist as its own pass: read the sub-skill's instructions, apply its Source → Relevance → Worklist → Action steps to the orchestrator-supplied inputs, and produce that sub-skill's complete findings-report before moving on.
+- Do not collapse multiple sub-skills into one shared reasoning step. Each sub-skill has a distinct knowledge subset and a distinct evaluation procedure; sharing one rolled-up scan dilutes per-skill attention and causes leaves to silently underreport (this has been observed in production: leaf skills returned empty `findings[]` while their standalone runs against the same diff produced multiple matches).
+- The agent self-review pass is its own final iteration. Begin it only after every sub-skill in the worklist has completed and its sub-result is recorded.
+- Sub-skills are independent: re-walking the diff once per sub-skill is correct and expected. The output schema accommodates this — `sub-results` carries one entry per sub-skill, each a complete findings-report.
+
+### Roll up sub-skill findings
+
+For each sub-skill in the worklist, executed one at a time per the discipline above:
 
 1. Invoke the sub-skill with the orchestrator's inputs, passing only the subset each sub-skill declares in its `inputs`.
 2. Capture the sub-skill's complete findings-report verbatim and append it to `sub-results`.
 3. If the sub-skill's `outcome` is `failed`, stop here for this sub-skill: its findings are not reliable per the DO contract and MUST NOT be copied into the super-skill's top-level `findings[]` or counted in `summary.counts`.
 4. Otherwise, append each entry from the sub-skill's `findings[]` to the super-skill's top-level `findings[]`, setting `from-sub-skill` to the sub-skill's `skill.id`. For non-citation findings (those whose `id` is a skill-defined slug rather than a reference path), prefix `id` with `<from-sub-skill>:` to prevent collisions across sub-skills. Other finding fields are preserved.
 
-Aggregate `summary.counts` and `summary.coverage` as the sums across invoked sub-skills whose `outcome` is not `failed`.
+### Agent self-review pass
+
+Each leaf sub-skill emits both knowledge-backed findings and, per its own contract, agent findings within its own domain. After every sub-skill has produced its sub-result, perform a super-skill self-review pass against the same task input. The goal of this pass is to surface defects the agent recognises on its own that **no single leaf could have surfaced** because they cross domain boundaries — architecture-level issues that touch performance and reliability at once, error-handling gaps that span security and UX, resource-lifecycle patterns that affect both correctness and performance, and similar cross-cutting concerns. BCQuality is an **additive** knowledge layer: it augments the agent's review judgement, it does not replace it.
+
+The self-review *reasoning* is mandatory — you MUST actually perform the cross-cutting analysis on every real-size PR, not skip it. But the pass need not produce any output: emitting **zero** agent findings is a valid, expected outcome whenever no candidate clears the precision bar in `skills/do.md` (*Agent findings*). Do not invent or pad findings to prove the pass ran. Always reason; emit only what survives the bar.
+
+Frame the pass by cross-cutting concerns — architecture, error handling, resource lifecycle — and by the seams between leaf domains. Do not duplicate domain-specific reasoning that belongs in a leaf: a security-only concern is the security leaf's responsibility, not the super-skill's. The super-skill pass adds value where no individual leaf has the right scope.
+
+For every candidate the agent identifies in this pass:
+
+1. **Validate against BCQuality knowledge.** Check the candidate against the knowledge files the sub-skills have already loaded for this task (visible via their `references` and `suppressed` lists in `sub-results`).
+   - If a BCQuality knowledge file matches the candidate, upgrade it to a knowledge-backed finding: cite the file in `references`, set `id` to the file's path, set `from-sub-skill` to the sub-skill that owns that knowledge domain, and merge with or deduplicate against any sub-skill finding that already covers the same concern at the same location.
+   - If a BCQuality knowledge file **explicitly contradicts** the candidate (its `## Best Practice` or `## Anti Pattern` says the opposite of what the agent flagged), suppress the candidate and do not surface it.
+   - Otherwise the candidate has no BCQuality coverage; emit it as a super-skill agent finding.
+2. **Emit agent finding.** Per DO's *Agent findings* rules:
+   - `from-sub-skill: "agent"` (the super-skill itself produced it)
+   - `references: []`
+   - `id` is a skill-defined slug prefixed with `agent:` (for example, `agent:missing-error-handling-on-http-call`).
+   - `confidence` capped at `medium`.
+   - `severity` capped at `minor` — agent findings are advisory and non-gating per `skills/do.md`; never assign `major` or `blocker` to a finding with no knowledge file behind it.
+   - `message` is non-empty and self-contained, describing both the issue and a concrete recommendation. A consumer rendering the finding has no knowledge-file footer to fall back on.
+   - `suggested-code` MUST be set when the fix is small, local, and mechanical. If a mechanical-looking finding omits it, set `suggested-code-omission-reason` with the reason (for example, the fix spans non-contiguous code or requires choosing a real production value).
+
+Leaf-level agent findings (those with `references: []` inside a sub-skill's report) are rolled up into the super-skill's top-level `findings[]` like any other sub-skill finding — they keep their `from-sub-skill: <leaf-id>` attribution and are not rewritten. They are not subject to the "MUST validate against knowledge" step above, because each leaf has already validated within its own domain.
+
+### Suggested-code guidance
+
+For both knowledge-backed findings rolled up from sub-skills and agent findings emitted in the self-review pass, populate `findings[].suggested-code` whenever a concrete code replacement is unambiguous from the diff context. This is a MUST for small, local, mechanical fixes. The payload MUST be a literal replacement for the source lines covered by `location` (typically a single line, or the line range in `location.range`) — no diff markers, fences, or commentary. Examples of good candidates: deleting dead code after `exit`, replacing `Count() > 0` with `not IsEmpty()`, moving an inline `Label` declaration to a codeunit-level `var` block, adding a missing property, replacing string-concatenated `Error`, changing an over-broad permission token, fixing whitespace or keyword casing. Skip `suggested-code` only when the fix requires choosing between multiple defensible alternatives, when the fix spans non-contiguous code, or when the surrounding context the agent cannot see could change the answer. If a mechanical-looking finding omits `suggested-code`, set `suggested-code-omission-reason`.
+
+Sub-skills MAY also emit `suggested-code` when their knowledge file unambiguously implies the replacement (the `.good.al` and `.bad.al` companion examples are useful here). The super-skill copies the field through unchanged.
+
+### Summary and rollup
+
+Aggregate `summary.counts` and `summary.coverage` as the sums across invoked sub-skills whose `outcome` is not `failed`. Agent findings emitted by the super-skill itself contribute to `summary.counts` but not to `summary.coverage` (coverage is a sub-skill worklist metric and is undefined for self-review).
 
 `suppressed[]` at the super-skill level remains empty. Knowledge-file-level suppression is reported by each sub-skill within its own entry in `sub-results`.
 
@@ -1919,7 +2709,7 @@ Output conforms to the DO output contract, extended with `sub-results` and `skip
   "skill": { "id": "al-code-review", "version": 1 },
   "outcome": "completed",
   "summary": {
-    "counts": { "blocker": 1, "major": 1, "minor": 2, "info": 0 },
+    "counts": { "blocker": 1, "major": 1, "minor": 3, "info": 0 },
     "coverage": { "worklist-size": 4, "items-evaluated": 4 }
   },
   "findings": [
@@ -1980,6 +2770,19 @@ Output conforms to the DO output contract, extended with `sub-results` and `skip
       ],
       "confidence": "medium",
       "from-sub-skill": "al-security-review"
+    },
+    {
+      "id": "agent:missing-error-handling-on-http-client",
+      "severity": "minor",
+      "message": "HttpClient.Send is called without inspecting the response status or wrapping the call in a TryFunction. Network or remote-server failures will surface as runtime errors to the user. Recommendation: branch on the HttpResponseMessage.IsSuccessStatusCode and either retry, surface a controlled error, or fall back, depending on the integration's contract.",
+      "location": {
+        "file": "src/Integration/ApiClient.Codeunit.al",
+        "line": 60,
+        "range": { "start-line": 60, "end-line": 64 }
+      },
+      "references": [],
+      "confidence": "medium",
+      "from-sub-skill": "agent"
     }
   ],
   "suppressed": [],
@@ -2104,7 +2907,7 @@ An orchestrator invokes this skill with either a `pr-diff` (the standard PR-revi
 
 ## Source
 
-Collect all knowledge files under `*/knowledge/performance/**/*.md`, across every enabled layer (`/microsoft/`, `/community/`, `/custom/`). Relevance trims the result to the subset that applies.
+Read the BCQuality knowledge index once — the `knowledge-index.json` BCQuality builds at the root of the knowledge checkout (Entry's preparation step regenerates it over the live, already-filtered clone — see `skills/entry.md`). It lists every article that survived layer and allow/deny filtering and carries, per article, its `path`, `layer`, `domain`, frontmatter dimensions, `keywords`, `title`, and a one-line `description` hint — exactly the fields Relevance and Worklist consume. Take the index entries whose `domain` is `performance` as this skill's candidate set across every enabled layer; do not open the individual article files at this step. Open an article's full body only once it enters the Worklist below, so a review reads the index plus the handful of worklisted articles instead of every file under `*/knowledge/performance/**`.
 
 ## Relevance
 
@@ -2123,9 +2926,9 @@ Narrow the relevant files to the subset that applies to the changes under review
 
 - The changed AL object names and types — especially tables, pages with SourceTable bindings, reports, queries, and codeunits performing record iteration.
 - The changed procedures and triggers, weighted toward those that perform loops, Find/FindSet/FindFirst calls, CalcFields, CalcSums, FlowField access, or cross-table navigation.
-- Tokens extracted from the diff that relate to data access (SetRange, SetFilter, SetLoadFields, SetCurrentKey, FindSet, Repeat…Until, CalcFields, CalcSums).
+- Tokens extracted from the diff that relate to data access and hot-path costs (`SetRange`, `SetFilter`, `SetLoadFields`, `SetCurrentKey`, `FindSet`, `ReadIsolation`, `LockTable`, `ModifyAll`, `DeleteAll`, `TextBuilder`, `Dictionary`, `temporary`, `repeat`, `until`, `CalcFields`, `CalcSums`).
 
-A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from filename and Description) matches a changed object type.
+A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from the index entry's `path`, `title`, and `description`) matches a changed object type. Read an article's full file — its `## Best Practice` / `## Anti Pattern` bodies — only after it makes the worklist; candidate selection uses the index alone.
 
 Once the candidate worklist is known, resolve layer-precedence conflicts per READ. Drop lower-precedence files whose normative guidance (`## Best Practice` or `## Anti Pattern`) directly contradicts a higher-precedence candidate, and record each dropped file in `suppressed` with `reason: "layer-precedence"`. Files that would have been candidates but are hidden because their layer is disabled in consumer configuration are recorded with `reason: "configuration"`. Files that never became candidates are NOT recorded in `suppressed`.
 
@@ -2144,6 +2947,12 @@ Set `confidence` to:
 - `high` when the detection is based on an unambiguous pattern match (identifier, syntax, object type).
 - `medium` when detection relies on heuristics or when any frontmatter dimension was `unknown`.
 - `low` when the finding is an advisory derived only from applicability.
+
+After evaluating each worklist entry, also consider whether the diff exhibits a performance defect the agent recognises from its general AL knowledge that no knowledge file in the worklist covers. Such candidates are agent findings within this skill's domain — emit them with `references: []`, an `id` slug prefixed with `agent:`, `confidence` capped at `medium`, `severity` capped at `minor` (agent findings are advisory and non-gating), and a `message` that is self-contained (describing both the issue and a concrete recommendation, since there is no knowledge-file footer for the consumer to fall back on). Hold every candidate to the precision bar in `skills/do.md` (*Agent findings*): emit only a concrete, material performance defect a knowledgeable BC reviewer would agree is wrong — steelman it first and drop anything stylistic, speculative, dependent on code outside the diff, or merely a valid alternative; when in doubt, omit. The scope is strictly performance; defects outside this domain belong to other leaves and MUST NOT be emitted here. Before emitting, check the worklist for a knowledge file that matches the candidate — if one exists, upgrade the candidate to a knowledge-backed finding instead. See `skills/do.md` for the full contract.
+
+For every emitted finding, decide whether the fix is mechanical. A fix is mechanical when it is small, local, and unambiguous from the diff context (for example: delete unreachable lines; replace `Count() > 0` with `not IsEmpty()`; move a local `Label` to object scope; add a missing `ToolTip`, `OptionCaption`, or `DataClassification`; replace a string-concatenated `Error` with a Label-backed call; change an over-broad permission token; or add an obvious `else`/guard branch). For mechanical findings, emit `findings[].suggested-code` with the literal replacement for the source lines indicated by `location`. The payload must be a verbatim replacement — no diff markers, no fences, no commentary — that the consumer can render as a one-click suggestion. When a `.good.al` companion exists and the diff context matches the `.bad.al` shape, adapt the `.good.al` replacement into `suggested-code`.
+
+Omit `suggested-code` only when the appropriate fix depends on context the skill cannot determine, when multiple defensible replacements exist, or when the fix spans non-contiguous code. If a finding is mechanical-looking but you omit `suggested-code`, set `findings[].suggested-code-omission-reason` to a short explanation. See `skills/do.md` for the full contract.
 
 Outcome selection:
 
@@ -2222,7 +3031,7 @@ An orchestrator invokes this skill with either a `pr-diff` (the standard PR-revi
 
 ## Source
 
-Collect all knowledge files under `*/knowledge/privacy/**/*.md`, across every enabled layer (`/microsoft/`, `/community/`, `/custom/`). Relevance trims the result to the subset that applies.
+Read the BCQuality knowledge index once — the `knowledge-index.json` BCQuality builds at the root of the knowledge checkout (Entry's preparation step regenerates it over the live, already-filtered clone — see `skills/entry.md`). It lists every article that survived layer and allow/deny filtering and carries, per article, its `path`, `layer`, `domain`, frontmatter dimensions, `keywords`, `title`, and a one-line `description` hint — exactly the fields Relevance and Worklist consume. Take the index entries whose `domain` is `privacy` as this skill's candidate set across every enabled layer; do not open the individual article files at this step. Open an article's full body only once it enters the Worklist below, so a review reads the index plus the handful of worklisted articles instead of every file under `*/knowledge/privacy/**`.
 
 ## Relevance
 
@@ -2237,13 +3046,13 @@ Discard files that are not applicable. Retain conditionally applicable files (an
 
 ## Worklist
 
-Narrow the relevant files to the subset that applies to the changes under review. For each relevant file, compute overlap against:
+Narrow the relevant files to the subset that applies to the changes under review. Exclude test codeunits, test libraries, test helper code, files under test/Test/Tests paths, and objects with `Subtype = Test`; test data is synthetic and does not ship to customers. For each relevant file, compute overlap against:
 
-- The changed AL object names and types — especially tables and tableextensions (for `DataClassification` on fields), codeunits that call `Error` or `Session.LogMessage`, codeunits performing outgoing HTTP requests with customer data, and objects reading or writing `IsolatedStorage`.
-- The changed procedures and triggers, weighted toward those that call `Error`, `Session.LogMessage`, `StrSubstNo`, `GetLastErrorText`, `HttpClient.Post`/`Get`, `IsolatedStorage.Set`/`SetEncrypted`/`Get`, or `PrivacyNotice.GetPrivacyNoticeApprovalState`.
-- Tokens extracted from the diff that relate to privacy (`DataClassification`, `CustomerContent`, `EndUserIdentifiableInformation`, `SystemMetadata`, `ToBeClassified`, `PrivacyNotice`, `GetLastErrorText`, `TelemetryScope`).
+- The changed AL object names and types — especially tables and tableextensions (for `DataClassification` on fields), codeunits that call `Error`, `Session.LogMessage`, or `FeatureTelemetry`, codeunits performing outgoing HTTP requests with customer data, migration codeunits, and objects reading or writing `IsolatedStorage`.
+- The changed procedures and triggers, weighted toward those that call `Error`, `Session.LogMessage`, `StrSubstNo`, `GetLastErrorText`, `FeatureTelemetry.LogUsage`/`LogUptake`/`LogError`, `HttpClient.Post`/`Get`, `IsolatedStorage.Set`/`SetEncrypted`/`Get`, or `PrivacyNotice.GetPrivacyNoticeApprovalState`.
+- Tokens extracted from the diff that relate to privacy (`DataClassification`, `CustomerContent`, `EndUserIdentifiableInformation`, `EndUserPseudonymousIdentifiers`, `SystemMetadata`, `ToBeClassified`, `PrivacyNotice`, `GetLastErrorText`, `TelemetryScope`, `FeatureTelemetry`, `CustomDimensions`, `LogUsage`, `LogUptake`, `LogError`, `HybridSL`, `HybridGP`, `HybridBC`).
 
-A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from filename and Description) matches a changed object type.
+A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from the index entry's `path`, `title`, and `description`) matches a changed object type. Read an article's full file — its `## Best Practice` / `## Anti Pattern` bodies — only after it makes the worklist; candidate selection uses the index alone.
 
 Once the candidate worklist is known, resolve layer-precedence conflicts per READ. Drop lower-precedence files whose normative guidance (`## Best Practice` or `## Anti Pattern`) directly contradicts a higher-precedence candidate, and record each dropped file in `suppressed` with `reason: "layer-precedence"`. Files that would have been candidates but are hidden because their layer is disabled in consumer configuration are recorded with `reason: "configuration"`. Files that never became candidates are NOT recorded in `suppressed`.
 
@@ -2262,6 +3071,12 @@ Set `confidence` to:
 - `high` when the detection is based on an unambiguous pattern match (identifier, syntax, object type).
 - `medium` when detection relies on heuristics or when any frontmatter dimension was `unknown`.
 - `low` when the finding is an advisory derived only from applicability.
+
+After evaluating each worklist entry, also consider whether the diff exhibits a privacy defect the agent recognises from its general AL knowledge that no knowledge file in the worklist covers. Such candidates are agent findings within this skill's domain — emit them with `references: []`, an `id` slug prefixed with `agent:`, `confidence` capped at `medium`, `severity` capped at `minor` (agent findings are advisory and non-gating), and a `message` that is self-contained (describing both the issue and a concrete recommendation, since there is no knowledge-file footer for the consumer to fall back on). Hold every candidate to the precision bar in `skills/do.md` (*Agent findings*): emit only a concrete, material privacy defect a knowledgeable BC reviewer would agree is wrong — steelman it first and drop anything stylistic, speculative, dependent on code outside the diff, or merely a valid alternative; when in doubt, omit. The scope is strictly privacy; defects outside this domain belong to other leaves and MUST NOT be emitted here. Before emitting, check the worklist for a knowledge file that matches the candidate — if one exists, upgrade the candidate to a knowledge-backed finding instead. See `skills/do.md` for the full contract.
+
+For every emitted finding, decide whether the fix is mechanical. A fix is mechanical when it is small, local, and unambiguous from the diff context (for example: delete unreachable lines; replace `Count() > 0` with `not IsEmpty()`; move a local `Label` to object scope; add a missing `ToolTip`, `OptionCaption`, or `DataClassification`; replace a string-concatenated `Error` with a Label-backed call; change an over-broad permission token; or add an obvious `else`/guard branch). For mechanical findings, emit `findings[].suggested-code` with the literal replacement for the source lines indicated by `location`. The payload must be a verbatim replacement — no diff markers, no fences, no commentary — that the consumer can render as a one-click suggestion. When a `.good.al` companion exists and the diff context matches the `.bad.al` shape, adapt the `.good.al` replacement into `suggested-code`.
+
+Omit `suggested-code` only when the appropriate fix depends on context the skill cannot determine, when multiple defensible replacements exist, or when the fix spans non-contiguous code. If a finding is mechanical-looking but you omit `suggested-code`, set `findings[].suggested-code-omission-reason` to a short explanation. See `skills/do.md` for the full contract.
 
 Outcome selection:
 
@@ -2312,7 +3127,7 @@ An orchestrator invokes this skill with either a `pr-diff` (the standard PR-revi
 
 ## Source
 
-Collect all knowledge files under `*/knowledge/security/**/*.md`, across every enabled layer (`/microsoft/`, `/community/`, `/custom/`). Relevance trims the result to the subset that applies.
+Read the BCQuality knowledge index once — the `knowledge-index.json` BCQuality builds at the root of the knowledge checkout (Entry's preparation step regenerates it over the live, already-filtered clone — see `skills/entry.md`). It lists every article that survived layer and allow/deny filtering and carries, per article, its `path`, `layer`, `domain`, frontmatter dimensions, `keywords`, `title`, and a one-line `description` hint — exactly the fields Relevance and Worklist consume. Take the index entries whose `domain` is `security` as this skill's candidate set across every enabled layer; do not open the individual article files at this step. Open an article's full body only once it enters the Worklist below, so a review reads the index plus the handful of worklisted articles instead of every file under `*/knowledge/security/**`.
 
 ## Relevance
 
@@ -2329,11 +3144,11 @@ Discard files that are not applicable. Retain conditionally applicable files (an
 
 Narrow the relevant files to the subset that applies to the changes under review. For each relevant file, compute overlap against:
 
-- The changed AL object names and types — especially permission sets, codeunits handling authentication or authorization, objects touching `Isolated Storage`, `OAuth2` flows, web service endpoints, and API pages.
-- The changed procedures and triggers, weighted toward those that call `HttpClient`, write to telemetry, read or write secrets, manipulate record-level security, or bypass the permission model (for example, `Record.WritePermission`, direct table access from a non-owning app).
-- Tokens extracted from the diff that relate to security concerns (`IsolatedStorage`, `OAuth2`, `Secret`, `Password`, `Token`, `HttpClient`, `Permission`, `Session`, `UserSecurityId`, `Commit`).
+- The changed AL object names and types — especially permission sets, codeunits handling authentication or authorization, objects touching `Isolated Storage`, `OAuth2` flows, web service endpoints, API pages, event publishers, and RecordRef helpers.
+- The changed procedures and triggers, weighted toward those that call `HttpClient`, validate or compose URLs, write to telemetry, read or write secrets, unwrap SecretText, manipulate record-level security, expose var Boolean guard parameters, or bypass the permission model (for example, `RecordRef.Open`, `Record.WritePermission`, direct table access from a non-owning app).
+- Tokens extracted from the diff that relate to security concerns (`IsolatedStorage`, `SetEncrypted`, `OAuth2`, `SecretText`, `Unwrap`, `NonDebuggable`, `Password`, `Token`, `HttpClient`, `Uri`, `AreURIsHaveSameHost`, `IsValidURIPattern`, `RecordRef`, `RecordId`, `Open`, `IntegrationEvent`, `SkipValidation`, `HasAccess`, `Permission`, `UserSecurityId`, `Commit`).
 
-A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from filename and Description) matches a changed object type.
+A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from the index entry's `path`, `title`, and `description`) matches a changed object type. Read an article's full file — its `## Best Practice` / `## Anti Pattern` bodies — only after it makes the worklist; candidate selection uses the index alone.
 
 Once the candidate worklist is known, resolve layer-precedence conflicts per READ. Drop lower-precedence files whose normative guidance (`## Best Practice` or `## Anti Pattern`) directly contradicts a higher-precedence candidate, and record each dropped file in `suppressed` with `reason: "layer-precedence"`. Files that would have been candidates but are hidden because their layer is disabled in consumer configuration are recorded with `reason: "configuration"`. Files that never became candidates are NOT recorded in `suppressed`.
 
@@ -2352,6 +3167,12 @@ Set `confidence` to:
 - `high` when the detection is based on an unambiguous pattern match (identifier, syntax, object type).
 - `medium` when detection relies on heuristics or when any frontmatter dimension was `unknown`.
 - `low` when the finding is an advisory derived only from applicability.
+
+After evaluating each worklist entry, also consider whether the diff exhibits a security defect the agent recognises from its general AL knowledge that no knowledge file in the worklist covers. Such candidates are agent findings within this skill's domain — emit them with `references: []`, an `id` slug prefixed with `agent:`, `confidence` capped at `medium`, `severity` capped at `minor` (agent findings are advisory and non-gating), and a `message` that is self-contained (describing both the issue and a concrete recommendation, since there is no knowledge-file footer for the consumer to fall back on). Hold every candidate to the precision bar in `skills/do.md` (*Agent findings*): emit only a concrete, material security defect a knowledgeable BC reviewer would agree is wrong — steelman it first and drop anything stylistic, speculative, dependent on code outside the diff, or merely a valid alternative; when in doubt, omit. The scope is strictly security; defects outside this domain belong to other leaves and MUST NOT be emitted here. Before emitting, check the worklist for a knowledge file that matches the candidate — if one exists, upgrade the candidate to a knowledge-backed finding instead. See `skills/do.md` for the full contract.
+
+For every emitted finding, decide whether the fix is mechanical. A fix is mechanical when it is small, local, and unambiguous from the diff context (for example: delete unreachable lines; replace `Count() > 0` with `not IsEmpty()`; move a local `Label` to object scope; add a missing `ToolTip`, `OptionCaption`, or `DataClassification`; replace a string-concatenated `Error` with a Label-backed call; change an over-broad permission token; or add an obvious `else`/guard branch). For mechanical findings, emit `findings[].suggested-code` with the literal replacement for the source lines indicated by `location`. The payload must be a verbatim replacement — no diff markers, no fences, no commentary — that the consumer can render as a one-click suggestion. When a `.good.al` companion exists and the diff context matches the `.bad.al` shape, adapt the `.good.al` replacement into `suggested-code`.
+
+Omit `suggested-code` only when the appropriate fix depends on context the skill cannot determine, when multiple defensible replacements exist, or when the fix spans non-contiguous code. If a finding is mechanical-looking but you omit `suggested-code`, set `findings[].suggested-code-omission-reason` to a short explanation. See `skills/do.md` for the full contract.
 
 Outcome selection:
 
@@ -2432,7 +3253,7 @@ An orchestrator invokes this skill with either a `pr-diff` or a `file-path`. The
 
 ## Source
 
-Collect all knowledge files under `*/knowledge/style/**/*.md`, across every enabled layer.
+Read the BCQuality knowledge index once — the `knowledge-index.json` BCQuality builds at the root of the knowledge checkout (Entry's preparation step regenerates it over the live, already-filtered clone — see `skills/entry.md`). It lists every article that survived layer and allow/deny filtering and carries, per article, its `path`, `layer`, `domain`, frontmatter dimensions, `keywords`, `title`, and a one-line `description` hint — exactly the fields Relevance and Worklist consume. Take the index entries whose `domain` is `style` as this skill's candidate set across every enabled layer; do not open the individual article files at this step. Open an article's full body only once it enters the Worklist below, so a review reads the index plus the handful of worklisted articles instead of every file under `*/knowledge/style/**`.
 
 ## Relevance
 
@@ -2453,7 +3274,7 @@ Narrow the relevant files to the subset that applies to the changes under review
 - Changed declarations, weighted toward `: Label '...'`, `: TextConst '...'`, temporary record variables, option fields, error-handling call sites, and codeunit-internal method calls.
 - Tokens extracted from the diff (`Label`, `TextConst`, `Locked`, `Comment`, `MaxLength`, `temporary`, `OptionMembers`, `OptionCaption`, `APIPublisher`, `APIGroup`, `APIVersion`, `EntityName`, `EntitySetName`, `DelayedInsert`, `FieldCaption`, `TableCaption`, `FieldName`, `TableName`, `Page.RunModal`, `Report.Run`, `this.`, `StrSubstNo`).
 
-A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic matches a changed object or declaration.
+A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from the index entry's `path`, `title`, and `description`) matches a changed object or declaration. Read an article's full file — its `## Best Practice` / `## Anti Pattern` bodies — only after it makes the worklist; candidate selection uses the index alone.
 
 Once the candidate worklist is known, resolve layer-precedence conflicts per READ and record suppressions.
 
@@ -2468,6 +3289,12 @@ Set `confidence` to:
 - `high` when the detection is based on an unambiguous pattern match.
 - `medium` when detection relies on heuristics or when any frontmatter dimension was `unknown`.
 - `low` when the finding is an advisory derived only from applicability.
+
+After evaluating each worklist entry, also consider whether the diff exhibits a style defect the agent recognises from its general AL knowledge that no knowledge file in the worklist covers. Such candidates are agent findings within this skill's domain — emit them with `references: []`, an `id` slug prefixed with `agent:`, `confidence` capped at `medium`, `severity` capped at `minor` (agent findings are advisory and non-gating), and a `message` that is self-contained (describing both the issue and a concrete recommendation, since there is no knowledge-file footer for the consumer to fall back on). Hold every candidate to the precision bar in `skills/do.md` (*Agent findings*): emit only a clear, widely-accepted AL style violation with a concrete basis a knowledgeable BC reviewer would agree on — steelman it first and drop personal preference, speculation, and any single defensible formatting choice among several; when in doubt, omit. The scope is strictly style; defects outside this domain belong to other leaves and MUST NOT be emitted here. Before emitting, check the worklist for a knowledge file that matches the candidate — if one exists, upgrade the candidate to a knowledge-backed finding instead. See `skills/do.md` for the full contract.
+
+For every emitted finding, decide whether the fix is mechanical. A fix is mechanical when it is small, local, and unambiguous from the diff context (for example: delete unreachable lines; replace `Count() > 0` with `not IsEmpty()`; move a local `Label` to object scope; add a missing `ToolTip`, `OptionCaption`, or `DataClassification`; replace a string-concatenated `Error` with a Label-backed call; change an over-broad permission token; or add an obvious `else`/guard branch). For mechanical findings, emit `findings[].suggested-code` with the literal replacement for the source lines indicated by `location`. The payload must be a verbatim replacement — no diff markers, no fences, no commentary — that the consumer can render as a one-click suggestion. When a `.good.al` companion exists and the diff context matches the `.bad.al` shape, adapt the `.good.al` replacement into `suggested-code`.
+
+Omit `suggested-code` only when the appropriate fix depends on context the skill cannot determine, when multiple defensible replacements exist, or when the fix spans non-contiguous code. If a finding is mechanical-looking but you omit `suggested-code`, set `findings[].suggested-code-omission-reason` to a short explanation. See `skills/do.md` for the full contract.
 
 Outcome selection:
 
@@ -2509,24 +3336,24 @@ Output conforms to the DO output contract. A populated example:
 ```
 
 
-# AL UI text review
+# AL UI and accessibility review
 
-Reviews AL page source against the `ui` knowledge domain in BCQuality and emits a findings report. This is a leaf action skill: it invokes no sub-skills. It is one of the skills composed by `al-code-review`.
+Reviews AL page source and control add-in UI files against the `ui` knowledge domain in BCQuality and emits a findings report. This is a leaf action skill: it invokes no sub-skills. It is one of the skills composed by `al-code-review`.
 
-UI findings apply to page files — files that declare `PageType = ...`, including `*.Page.al` under the standard file-naming convention. The skill returns `not-applicable` when the diff contains no page changes.
+UI findings apply to page files — files that declare `PageType = ...`, including `*.Page.al` under the standard file-naming convention — and to JavaScript/CSS/HTML files that render Business Central control add-ins. The skill returns `not-applicable` when the diff contains no page or control add-in UI changes.
 
 An orchestrator invokes this skill with either a `pr-diff` or a `file-path`. The skill produces a single JSON document conforming to the DO output contract.
 
 ## Source
 
-Collect all knowledge files under `*/knowledge/ui/**/*.md`, across every enabled layer.
+Read the BCQuality knowledge index once — the `knowledge-index.json` BCQuality builds at the root of the knowledge checkout (Entry's preparation step regenerates it over the live, already-filtered clone — see `skills/entry.md`). It lists every article that survived layer and allow/deny filtering and carries, per article, its `path`, `layer`, `domain`, frontmatter dimensions, `keywords`, `title`, and a one-line `description` hint — exactly the fields Relevance and Worklist consume. Take the index entries whose `domain` is `ui` as this skill's candidate set across every enabled layer; do not open the individual article files at this step. Open an article's full body only once it enters the Worklist below, so a review reads the index plus the handful of worklisted articles instead of every file under `*/knowledge/ui/**`.
 
 ## Relevance
 
 Apply the frontmatter matching rules defined in READ against the task context:
 
 - `bc-version` — the target BC version from the PR branch's `app.json` or the orchestrator-supplied version. If unavailable, the dimension is `unknown`.
-- `technologies` — `[al]`.
+- `technologies` — `[al]` or `[javascript]`.
 - `countries` — the countries declared in the consuming app's `app.json`. If absent, `unknown`.
 - `application-area` — pass the actual set declared by the changed objects; do not substitute `[all]`.
 
@@ -2536,11 +3363,11 @@ Discard files that are not applicable. Retain conditionally applicable files onl
 
 Narrow the relevant files to the subset that applies to the changes under review.
 
-- **Page-file filter.** UI review applies only to files declaring `page`, `pageextension`, or `pagecustomization`. When the diff contains no such files, return `outcome: "not-applicable"` without evaluating knowledge files.
-- For each relevant knowledge file, compute overlap against changed page declarations, weighted toward `Caption`, `ToolTip`, `AboutTitle`, `AboutText`, `OptionCaption`, action definitions, and field-level properties.
-- Tokens extracted from the diff (`Caption`, `ToolTip`, `AboutTitle`, `AboutText`, `PageType`, `&`, `Specifies`, `Message(`, `Confirm(`, `Error(` in a page context, `Disabled`, `Invalid`, `Whitelist`, `Blacklist`, trailing punctuation patterns on captions).
+- **UI-file filter.** UI review applies to files declaring `page`, `pageextension`, or `pagecustomization`, and to control add-in JavaScript/CSS/HTML that changes rendered UI. When the diff contains no such files, return `outcome: "not-applicable"` without evaluating knowledge files.
+- For each relevant knowledge file, compute overlap against changed page declarations and control add-in UI files, weighted toward `Caption`, `ToolTip`, `AboutTitle`, `AboutText`, `OptionCaption`, `ShowCaption`, `InstructionalText`, `GridLayout`, `Style`, `StyleExpr`, action definitions, field-level properties, DOM creation, ARIA attributes, and keyboard/focus handlers.
+- Tokens extracted from the diff (`Caption`, `ToolTip`, `AboutTitle`, `AboutText`, `PageType`, `ShowCaption`, `InstructionalText`, `grid`, `fixed`, `GridLayout`, `Style`, `StyleExpr`, `Favorable`, `Unfavorable`, `Ambiguous`, `cuegroup`, `controladdin`, `usercontrol`, `aria-`, `tabindex`, `keydown`, `focus`, `innerHTML`, `createElement`, `&`, `Specifies`, `Message(`, `Confirm(`, `Error(` in a page context, `Disabled`, `Invalid`, `Whitelist`, `Blacklist`, trailing punctuation patterns on captions).
 
-A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic matches a changed page element.
+A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from the index entry's `path`, `title`, and `description`) matches a changed page element. Read an article's full file — its `## Best Practice` / `## Anti Pattern` bodies — only after it makes the worklist; candidate selection uses the index alone.
 
 Once the candidate worklist is known, resolve layer-precedence conflicts per READ and record suppressions.
 
@@ -2548,7 +3375,7 @@ When the post-conflict worklist is empty because no applicable UI knowledge exis
 
 ## Action
 
-For each worklist entry, evaluate the diff against the file's `## Best Practice` and `## Anti Pattern` sections. UI text findings are generally `minor` — they affect localization and polish rather than correctness. Reach for `major` only when a banned term appears in customer-facing text or a caption truncation is guaranteed at the stated character limit.
+For each worklist entry, evaluate the diff against the file's `## Best Practice` and `## Anti Pattern` sections. UI text findings are generally `minor` — they affect localization and polish rather than correctness. Accessibility findings for missing labels, broken grid semantics, semantic color without text meaning, or UI-rendering control add-in changes can be `major`; use `minor` for low-risk manual-review reminders and polish issues.
 
 Set `confidence` to:
 
@@ -2556,11 +3383,17 @@ Set `confidence` to:
 - `medium` when detection relies on heuristics (judging whether a caption is a noun phrase or a sentence phrase) or when any frontmatter dimension was `unknown`.
 - `low` when the finding is an advisory derived only from applicability.
 
+After evaluating each worklist entry, also consider whether the diff exhibits a UI defect the agent recognises from its general AL knowledge that no knowledge file in the worklist covers. Such candidates are agent findings within this skill's domain — emit them with `references: []`, an `id` slug prefixed with `agent:`, `confidence` capped at `medium`, `severity` capped at `minor` (agent findings are advisory and non-gating), and a `message` that is self-contained (describing both the issue and a concrete recommendation, since there is no knowledge-file footer for the consumer to fall back on). Hold every candidate to the precision bar in `skills/do.md` (*Agent findings*): emit only a concrete, material UI defect a knowledgeable BC reviewer would agree is wrong — steelman it first and drop anything speculative, dependent on code outside the diff, or merely a valid alternative; when in doubt, omit. The scope is strictly UI; defects outside this domain belong to other leaves and MUST NOT be emitted here. Before emitting, check the worklist for a knowledge file that matches the candidate — if one exists, upgrade the candidate to a knowledge-backed finding instead. See `skills/do.md` for the full contract.
+
+For every emitted finding, decide whether the fix is mechanical. A fix is mechanical when it is small, local, and unambiguous from the diff context (for example: delete unreachable lines; replace `Count() > 0` with `not IsEmpty()`; move a local `Label` to object scope; add a missing `ToolTip`, `OptionCaption`, or `DataClassification`; replace a string-concatenated `Error` with a Label-backed call; change an over-broad permission token; or add an obvious `else`/guard branch). For mechanical findings, emit `findings[].suggested-code` with the literal replacement for the source lines indicated by `location`. The payload must be a verbatim replacement — no diff markers, no fences, no commentary — that the consumer can render as a one-click suggestion. When a `.good.al` companion exists and the diff context matches the `.bad.al` shape, adapt the `.good.al` replacement into `suggested-code`.
+
+Omit `suggested-code` only when the appropriate fix depends on context the skill cannot determine, when multiple defensible replacements exist, or when the fix spans non-contiguous code. If a finding is mechanical-looking but you omit `suggested-code`, set `findings[].suggested-code-omission-reason` to a short explanation. See `skills/do.md` for the full contract.
+
 Outcome selection:
 
 - `completed` — the skill evaluated every worklist item.
 - `no-knowledge` — no applicable UI knowledge survived filtering.
-- `not-applicable` — the diff contains no page, pageextension, or pagecustomization files.
+- `not-applicable` — the diff contains no page, pageextension, pagecustomization, or control add-in UI files.
 - `partial` — a budget was hit before the worklist was exhausted.
 - `failed` — an unrecoverable error occurred.
 
@@ -2604,7 +3437,7 @@ An orchestrator invokes this skill with either a `pr-diff` (the standard PR-revi
 
 ## Source
 
-Collect all knowledge files under `*/knowledge/upgrade/**/*.md`, across every enabled layer (`/microsoft/`, `/community/`, `/custom/`). Relevance trims the result to the subset that applies.
+Read the BCQuality knowledge index once — the `knowledge-index.json` BCQuality builds at the root of the knowledge checkout (Entry's preparation step regenerates it over the live, already-filtered clone — see `skills/entry.md`). It lists every article that survived layer and allow/deny filtering and carries, per article, its `path`, `layer`, `domain`, frontmatter dimensions, `keywords`, `title`, and a one-line `description` hint — exactly the fields Relevance and Worklist consume. Take the index entries whose `domain` is `upgrade` as this skill's candidate set across every enabled layer; do not open the individual article files at this step. Open an article's full body only once it enters the Worklist below, so a review reads the index plus the handful of worklisted articles instead of every file under `*/knowledge/upgrade/**`.
 
 ## Relevance
 
@@ -2622,10 +3455,10 @@ Discard files that are not applicable. Retain conditionally applicable files (an
 Narrow the relevant files to the subset that applies to the changes under review. For each relevant file, compute overlap against:
 
 - The changed AL object names and types — especially codeunits with `Subtype = Upgrade` or `Subtype = Install`, tables and tableextensions adding or changing fields, enums and enumextensions, and objects under `Hybrid*`/`Migration`/`Upgrade` namespaces.
-- The changed triggers and procedures, weighted toward `OnUpgradePerCompany`, `OnUpgradePerDatabase`, `OnInstallAppPerCompany`, and the `OnGetPerCompanyUpgradeTags`/`OnGetPerDatabaseUpgradeTags` subscribers.
-- Tokens extracted from the diff that relate to upgrade concerns (`Subtype = Upgrade`, `Upgrade Tag`, `HasUpgradeTag`, `SetUpgradeTag`, `DataTransfer`, `InitValue`, `ObsoleteState`, `ObsoleteReason`, `ObsoleteTag`, `DataVersion`, `ExecutionContext`, `value(`, `enum`, `enumextension`).
+- The changed triggers and procedures, weighted toward `OnUpgradePerCompany`, `OnUpgradePerDatabase`, `OnValidateUpgradePerCompany`, `OnValidateUpgradePerDatabase`, `OnInstallAppPerCompany`, and the `OnGetPerCompanyUpgradeTags`/`OnGetPerDatabaseUpgradeTags` subscribers.
+- Tokens extracted from the diff that relate to upgrade concerns (`Subtype = Upgrade`, `Upgrade Tag`, `HasUpgradeTag`, `SetUpgradeTag`, `OnValidateUpgrade`, `DataTransfer`, `CopyFields`, `InitValue`, `ObsoleteState`, `ObsoleteReason`, `ObsoleteTag`, `DataVersion`, `ExecutionContext`, `PrimaryKey`, `key(`, `field(`, `value(`, `enum`, `enumextension`, `HybridSL`, `HybridGP`, `HybridBC`, `HybridBaseDeployment`).
 
-A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic matches a changed object type. When the diff contains no upgrade-related changes by any of the above signals, return `outcome: "not-applicable"` without evaluating files.
+A file enters the candidate worklist when its `keywords` intersect the extracted tokens or its topic (derived from the index entry's `path`, `title`, and `description`) matches a changed object type. Read an article's full file — its `## Best Practice` / `## Anti Pattern` bodies — only after it makes the worklist; candidate selection uses the index alone. When the diff contains no upgrade-related changes by any of the above signals, return `outcome: "not-applicable"` without evaluating files.
 
 Once the candidate worklist is known, resolve layer-precedence conflicts per READ. Drop lower-precedence files whose normative guidance directly contradicts a higher-precedence candidate, and record each dropped file in `suppressed` with `reason: "layer-precedence"`. Files suppressed by configuration are recorded with `reason: "configuration"`.
 
@@ -2644,6 +3477,12 @@ Set `confidence` to:
 - `high` when the detection is based on an unambiguous pattern match.
 - `medium` when detection relies on heuristics or when any frontmatter dimension was `unknown`.
 - `low` when the finding is an advisory derived only from applicability.
+
+After evaluating each worklist entry, also consider whether the diff exhibits a upgrade defect the agent recognises from its general AL knowledge that no knowledge file in the worklist covers. Such candidates are agent findings within this skill's domain — emit them with `references: []`, an `id` slug prefixed with `agent:`, `confidence` capped at `medium`, `severity` capped at `minor` (agent findings are advisory and non-gating), and a `message` that is self-contained (describing both the issue and a concrete recommendation, since there is no knowledge-file footer for the consumer to fall back on). Hold every candidate to the precision bar in `skills/do.md` (*Agent findings*): emit only a concrete, material upgrade or breaking-change defect a knowledgeable BC reviewer would agree is wrong — steelman it first and drop anything stylistic, speculative, dependent on code outside the diff, or merely a valid alternative; when in doubt, omit. The scope is strictly upgrade; defects outside this domain belong to other leaves and MUST NOT be emitted here. Before emitting, check the worklist for a knowledge file that matches the candidate — if one exists, upgrade the candidate to a knowledge-backed finding instead. See `skills/do.md` for the full contract.
+
+For every emitted finding, decide whether the fix is mechanical. A fix is mechanical when it is small, local, and unambiguous from the diff context (for example: delete unreachable lines; replace `Count() > 0` with `not IsEmpty()`; move a local `Label` to object scope; add a missing `ToolTip`, `OptionCaption`, or `DataClassification`; replace a string-concatenated `Error` with a Label-backed call; change an over-broad permission token; or add an obvious `else`/guard branch). For mechanical findings, emit `findings[].suggested-code` with the literal replacement for the source lines indicated by `location`. The payload must be a verbatim replacement — no diff markers, no fences, no commentary — that the consumer can render as a one-click suggestion. When a `.good.al` companion exists and the diff context matches the `.bad.al` shape, adapt the `.good.al` replacement into `suggested-code`.
+
+Omit `suggested-code` only when the appropriate fix depends on context the skill cannot determine, when multiple defensible replacements exist, or when the fix spans non-contiguous code. If a finding is mechanical-looking but you omit `suggested-code`, set `findings[].suggested-code-omission-reason` to a short explanation. See `skills/do.md` for the full contract.
 
 Outcome selection:
 
@@ -2709,25 +3548,6 @@ See sample: `avoid-growing-globals-in-singleinstance-subscribers.good.al`.
 A SingleInstance subscriber that appends each event's payload to a global list, dictionary, or temporary record without a cap or cleanup trigger. The list grows for hours, memory pressure builds quietly, and debugging the root cause on a live environment is substantially harder than noticing the unbounded append in code review.
 
 See sample: `avoid-growing-globals-in-singleinstance-subscribers.bad.al`.
-
-
-# Call SetLoadFields before filters
-
-## Description
-
-`SetLoadFields` is folded into the database query that the subsequent `Find`, `FindSet`, or `FindFirst` executes. When it is called after filters have already been applied, the platform either ignores the specification or is forced into an extra round-trip to reload the narrower column set — negating the optimization. The placement rule is simple and absolute: `SetLoadFields` must come first.
-
-## Best Practice
-
-Use a consistent order on every record variable that participates in `SetLoadFields` optimization: declare the record, call `SetLoadFields` with the processing fields, apply `SetRange`/`SetFilter`, then `FindSet` and iterate. The order makes the optimization visible in code review and prevents accidental regressions when filters are refactored.
-
-See sample: `call-setloadfields-before-filters.good.al`.
-
-## Anti Pattern
-
-Setting filters first — because the filter logic is what the reviewer is thinking about — and then adding `SetLoadFields` just before the `FindSet`. The platform has already planned the query with the full column set; the `SetLoadFields` call is paid for without delivering any of the benefit.
-
-See sample: `call-setloadfields-before-filters.bad.al`.
 
 
 # Choose MaintainSIFTIndex by read-write ratio
@@ -2858,17 +3678,17 @@ See sample: `use-deleteall-for-filtered-bulk-deletion.bad.al`.
 
 ## Description
 
-Every field on every AL table and table extension must carry an explicit `DataClassification` property. The value drives GDPR tooling, data-subject requests, retention policies, and audit reporting — all of which rely on the field metadata to know what data to include, anonymize, or delete. A field with no `DataClassification` defaults to `ToBeClassified`, which is a compliance gap, not a neutral state.
+Every field on every AL table and table extension must have a resolved `DataClassification` value, either declared directly on the field or inherited from a table-level default. The value drives GDPR tooling, data-subject requests, retention policies, and audit reporting — all of which rely on the field metadata to know what data to include, anonymize, or delete. A field with no field-level property and no table-level default resolves to `ToBeClassified`, which is a compliance gap, not a neutral state.
 
 ## Best Practice
 
-Choose the narrowest value that accurately describes the field's content: `EndUserIdentifiableInformation` for data that directly identifies a person, `EndUserPseudonymousIdentifiers` for indirect identifiers, `CustomerContent` for business operational data, `SystemMetadata` for system-generated housekeeping, `AccountData` for tenant/billing, `OrganizationIdentifiableInformation` for organization-level identifiers. When uncertain between two values, pick the stronger protection.
+Choose the narrowest value that accurately describes the field's content: `EndUserIdentifiableInformation` for data that directly identifies a person, `EndUserPseudonymousIdentifiers` for indirect identifiers, `CustomerContent` for business operational data, `SystemMetadata` for system-generated housekeeping, `AccountData` for tenant/billing, `OrganizationIdentifiableInformation` for organization-level identifiers. Use a table-level default for homogeneous tables, and override individual fields whose content differs from that default. When uncertain between two values, pick the stronger protection.
 
 See sample: `classify-every-field-with-dataclassification.good.al`.
 
 ## Anti Pattern
 
-Leaving `DataClassification = ToBeClassified` on a field, or omitting the property entirely (which resolves to the same default). Code in this state fails compliance audits and breaks the subject-access-request and retention tooling that depends on the property being set correctly.
+Leaving `DataClassification = ToBeClassified` on a field, omitting classification when the table has no default, or relying on a table-level default that understates a field's actual content. Code in this state fails compliance audits and breaks the subject-access-request and retention tooling that depends on the property being set correctly.
 
 See sample: `classify-every-field-with-dataclassification.bad.al`.
 
