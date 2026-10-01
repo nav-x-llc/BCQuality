@@ -4060,6 +4060,63 @@ end;
 > **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
+When a unit of work must succeed or fail atomically, use a conditional `Codeunit.Run` (or
+`if not MyCodeunit.Run(Rec) then`) as the error boundary rather than a `[TryFunction]`.
+`[TryFunction]` does **not** roll back writes it catches, and the on-premises server rejects
+database writes inside a try method that is itself called from another try method. After
+a conditional `Run` returns — on either the success or the error path — the caller regains
+control to release subscriptions, clear context, and re-raise the error.
+
+## Best Practice
+
+```al
+// Wrap the unit of work in a dedicated codeunit and run it conditionally so the
+// caller always regains control for cleanup, and an error rolls back all writes.
+trigger OnAction()
+var
+    WorkRunner: Codeunit "NAVX My Work Runner";
+    ErrorText: Text;
+begin
+    WorkRunner.SetContext(Rec);
+    BindSubscription(WorkRunner);
+    if not WorkRunner.Run(Rec) then begin
+        ErrorText := GetLastErrorText();
+        ReleaseContext(WorkRunner);
+        Error('%1', ErrorText);
+    end;
+    ReleaseContext(WorkRunner);
+end;
+
+local procedure ReleaseContext(var Runner: Codeunit "NAVX My Work Runner")
+begin
+    UnbindSubscription(Runner);
+    Runner.ClearContext();
+end;
+```
+
+## Anti Pattern
+
+```al
+// BAD: uses SalesPost.Run() directly with no error boundary.
+// A posting failure leaves the modified component lines in place (uncommitted)
+// and the subscriber bound, because control never returns to the caller.
+trigger OnAction()
+var
+    SalesPost: Codeunit "Sales-Post";
+    Subscriber: Codeunit "NAVX My Subscriber";
+begin
+    Subscriber.SetContext(Rec);
+    BindSubscription(Subscriber);
+    SalesPost.Run(Rec); // BAD - no conditional; error unwinds past UnbindSubscription
+    UnbindSubscription(Subscriber); // BAD - never reached on error
+end;
+```
+
+
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
+## Description
+
 Every database read in AL can return false or raise a runtime error if the record
 does not exist. Unguarded reads are among the most common causes of production errors
 in Business Central extensions.
@@ -4417,6 +4474,106 @@ end;
 > **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
 ## Description
 
+Every call to `Record.Get()`, `Record.FindFirst()`, or `Record.FindSet()` must check the
+Boolean return value before accessing the record's fields. An unguarded call that silently
+continues when no record exists reads default (zero/blank) field values, producing incorrect
+results or posting corrupt data without any runtime error. Always branch on the return value
+or raise a descriptive error so the failure surface is explicit and the data path is safe.
+
+## Best Practice
+
+```al
+// Guard every database read and surface a clear error when the record is absent.
+local procedure GetPostingSetup(GLAccountNo: Code[20]): Code[20]
+var
+    GLAccount: Record "G/L Account";
+    GLAccountNotFoundErr: Label 'G/L Account %1 does not exist.', Comment = '%1 - G/L Account No.';
+begin
+    if not GLAccount.Get(GLAccountNo) then
+        Error(GLAccountNotFoundErr, GLAccountNo);
+    exit(GLAccount."Gen. Prod. Posting Group");
+end;
+
+// Guard FindFirst and handle the not-found case explicitly.
+local procedure GetFirstOpenEntry(CustomerNo: Code[20]; var CustLedgerEntry: Record "Cust. Ledger Entry"): Boolean
+begin
+    CustLedgerEntry.SetRange("Customer No.", CustomerNo);
+    CustLedgerEntry.SetRange(Open, true);
+    CustLedgerEntry.SetLoadFields("Entry No.", "Remaining Amount");
+    exit(CustLedgerEntry.FindFirst());
+end;
+```
+
+## Anti Pattern
+
+```al
+// BAD: return value of Get() is ignored; fields are read even when no record exists.
+local procedure GetPostingSetup(GLAccountNo: Code[20]): Code[20]
+var
+    GLAccount: Record "G/L Account";
+begin
+    GLAccount.Get(GLAccountNo); // BAD - unguarded, silently continues on miss
+    exit(GLAccount."Gen. Prod. Posting Group"); // BAD - blank when record not found
+end;
+
+// BAD: FindFirst() return value ignored; subsequent field access reads defaults.
+local procedure StampLedgerEntry(CustomerNo: Code[20])
+var
+    CustLedgerEntry: Record "Cust. Ledger Entry";
+begin
+    CustLedgerEntry.SetRange("Customer No.", CustomerNo);
+    CustLedgerEntry.FindFirst(); // BAD - no check; wrong entry used if not found
+    CustLedgerEntry."NAVX Custom Field" := 'X';
+    CustLedgerEntry.Modify();
+end;
+```
+
+
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
+## Description
+
+AL label variable names must end with a suffix that reflects their purpose:
+`Err` for user-facing error messages, `Msg` for informational messages,
+`Lbl` for UI captions and general labels, and `Tok` for non-translatable tokens
+(internal keys, format strings, storage keys) that carry `Locked = true`.
+Mixing suffixes — e.g. using `Err` for a token or `Txt` where `Tok` is required —
+causes translators to process strings that must never be translated and hides the
+intent of error-path labels from reviewers.
+
+## Best Practice
+
+```al
+var
+    // User-visible error: Err suffix.
+    BankAccNotFoundErr: Label 'Bank account %1 does not exist.', Comment = '%1 - Bank Account No.';
+    // User-visible informational message: Msg suffix.
+    RecordsProcessedMsg: Label '%1 records processed.', Comment = '%1 - count';
+    // UI caption: Lbl suffix.
+    JobItemPriceLbl: Label 'Job Item Price';
+    // Non-translatable internal token: Tok suffix + Locked = true.
+    ClientIdStorageKeyTok: Label 'NAVX_AUTHCONTEXT_CLIENT_ID', Locked = true;
+    JobGuardKeyTok: Label '%1|%2|%3', Comment = '%1 = ID, %2 = Job No., %3 = Version No.', Locked = true;
+```
+
+## Anti Pattern
+
+```al
+var
+    // BAD: Txt suffix used instead of Tok for a locked internal token.
+    AuthContextDescriptionTxt: Label 'Quinn AuthContext', Locked = true; // BAD - should be Tok
+    ClientIdStorageKeyTxt: Label 'NAVX_AUTHCONTEXT_CLIENT_ID', Locked = true; // BAD - should be Tok
+    // BAD: Err suffix used for an assertion message that is not an error label.
+    CWMQtyNotPopulatedErr: Label 'NAVX CWM Qty. to Handle was not populated.'; // BAD - use Msg
+    // BAD: string literal passed directly instead of a named label variable.
+    InsertPVSField(PVSField, 6010316, 50000, 'Job Item Price'); // BAD - should use a Lbl variable
+```
+
+
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
+## Description
+
 `Rec.Modify(true)` fires the table's `OnBeforeModify` and `OnAfterModify` triggers and all
 subscribers. `Rec.Modify(false)` skips those triggers entirely. This distinction is one of
 the most commonly misunderstood in AL and is a frequent source of missed audit entries, sync
@@ -4538,6 +4695,50 @@ codeunit 50000 "NAVX My New Codeunit"
 codeunit 60000 "NAVX My New Codeunit"
 {
     // app.json says idRanges: [{"from": 50000, "to": 59999}]
+}
+```
+
+
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
+## Description
+
+Once an AL object (table, codeunit, report, page, enum value, etc.) has been assigned an ID
+and shipped or committed, that ID **must never change**. Renumbering an existing object
+breaks permission sets, event subscriptions, saved report layouts, telemetry, and any
+third-party integrations that reference the original ID. New objects must claim an unused ID
+from within the extension's registered range; gaps in the sequence are acceptable.
+
+## Best Practice
+
+```al
+// Correct: the object keeps its original ID (99002) across all changes.
+codeunit 99002 "NAVX PPDG Rep Install Test"
+{
+    Subtype = Test;
+    // ... test logic ...
+}
+
+// Correct: enum extension values use IDs from the extension's own range.
+enumextension 60000 "NAVX Item Replenishment Ext" extends "Replenishment System"
+{
+    value(60000; "PVS Case") { Caption = 'PVS Case'; }
+}
+```
+
+## Anti Pattern
+
+```al
+// BAD: object ID changed from 99002 to 99100 — breaks permission sets and references.
+codeunit 99100 "NAVX PPDG Rep Install Test" // BAD - was 99002; renumbering is forbidden
+{
+    Subtype = Test;
+}
+
+// BAD: enum value ID taken from a PrintVis internal range instead of the extension range.
+enumextension 60000 "NAVX Item Replenishment Ext" extends "Replenishment System"
+{
+    value(6010312; "PVS Case") { Caption = 'PVS Case'; } // BAD - foreign range ID
 }
 ```
 
@@ -4789,6 +4990,65 @@ codeunit 50071 "NAVX Price Calc. For Group A"
         // identical to Template except one line
     end;
 }
+```
+
+
+
+> **Applies to:** BC 22.0 · 23.0 · 24.0 · 25.0
+## Description
+
+When a procedure accepts a `Record` parameter that is expected to be a temporary instance,
+declare it with the `temporary` modifier (`var Rec: Record "X" temporary`). Omitting the
+modifier allows callers to pass a real database record, which causes event subscribers that
+test `IsTemporary()` to skip processing, and procedures that call `Modify()` to write back
+to the live table unexpectedly. Apply the same discipline to `[EventSubscriber]` procedures
+that forward temporary records — mis-matching the modifier silently drops the `temporary`
+attribute and breaks callers that depend on isolation.
+
+## Best Practice
+
+```al
+// Declare the temporary modifier so callers and the compiler both enforce isolation.
+procedure TransferFromPVSJob(
+    var PVSJob: Record "PVS Job";
+    var TrackingEntry: Record "Reservation Entry" temporary;
+    OutstandingQty: Decimal;
+    FinishedQty: Decimal)
+begin
+    // Safe: TrackingEntry is guaranteed to be temporary; no accidental DB write.
+end;
+
+// In an event subscriber, guard against the record being temporary when the event
+// fires on non-table-trigger paths that reach temporary instances.
+[EventSubscriber(ObjectType::Table, Database::"Sales Line", OnAfterValidateEvent, 'No.', false, false)]
+local procedure SalesLineNoOnAfterValidate(var Rec: Record "Sales Line"; var xRec: Record "Sales Line"; CurrFieldNo: Integer)
+begin
+    if Rec.IsTemporary() then
+        exit;
+    // ... real logic ...
+end;
+```
+
+## Anti Pattern
+
+```al
+// BAD: temporary modifier omitted — compiler cannot enforce isolation.
+procedure TransferFromPVSJob(
+    var PVSJob: Record "PVS Job";
+    var TrackingEntry: Record "Reservation Entry"; // BAD - missing 'temporary'
+    OutstandingQty: Decimal;
+    FinishedQty: Decimal)
+begin
+    // Caller may pass a real Reservation Entry; accidental Modify() writes to DB.
+end;
+
+// BAD: no IsTemporary() guard — subscriber acts on temporary records it should skip.
+[EventSubscriber(ObjectType::Table, Database::"Sales Line", OnAfterValidateEvent, 'No.', false, false)]
+local procedure SalesLineNoOnAfterValidate(var Rec: Record "Sales Line"; var xRec: Record "Sales Line"; CurrFieldNo: Integer)
+begin
+    // BAD - fires on temporary instances too; unintended side-effects in what-if scenarios.
+    Rec."NAVX Custom Field" := 'X';
+end;
 ```
 
 
